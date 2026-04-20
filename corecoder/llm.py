@@ -1,11 +1,7 @@
-"""LLM provider layer - thin wrapper over OpenAI-compatible APIs.
-
-Since most providers (DeepSeek, Qwen, Kimi, GLM, Ollama, etc.) expose an
-OpenAI-compatible endpoint, we just use the openai SDK directly.  Switch
-provider by changing OPENAI_BASE_URL + OPENAI_API_KEY. That's it.
-"""
+"""LLM provider layer - thin wrapper over OpenAI-compatible APIs."""
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -28,172 +24,139 @@ class LLMResponse:
 
     @property
     def message(self) -> dict:
-        """Convert to OpenAI message format for appending to history."""
         msg: dict = {"role": "assistant", "content": self.content or None}
         if self.tool_calls:
             msg["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.name,
-                        "arguments": json.dumps(tc.arguments),
-                    },
-                }
+                {"id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)}}
                 for tc in self.tool_calls
             ]
         return msg
 
 
-# pricing per million tokens: (input, output)
-# sources: openai.com/api/pricing, api-docs.deepseek.com, platform.claude.com,
-#          platform.moonshot.ai, alibabacloud.com/help/en/model-studio
 _PRICING = {
-    # OpenAI - current flagships
-    "gpt-5.4": (2.5, 15),
-    "gpt-5.4-mini": (0.75, 4.5),
-    "gpt-5.4-nano": (0.2, 1.25),
-    "o4-mini": (1.1, 4.4),
-    # OpenAI - previous gen (still widely used)
-    "gpt-4.1": (2, 8),
-    "gpt-4.1-mini": (0.4, 1.6),
-    "gpt-4.1-nano": (0.1, 0.4),
-    "gpt-4o": (2.5, 10),
-    "gpt-4o-mini": (0.15, 0.6),
-    # DeepSeek
-    "deepseek-chat": (0.27, 1.10),
-    "deepseek-reasoner": (0.55, 2.19),
-    # Anthropic Claude
-    "claude-opus-4-6": (5, 25),
-    "claude-sonnet-4-6": (3, 15),
-    "claude-haiku-4-5": (1, 5),
-    # Alibaba Qwen
-    "qwen3-max": (0.78, 3.9),
-    "qwen3-plus": (0.26, 0.78),
-    "qwen-max": (0.78, 3.9),
-    # Moonshot Kimi
+    "gpt-5.4": (2.5, 15), "gpt-5.4-mini": (0.75, 4.5), "gpt-5.4-nano": (0.2, 1.25),
+    "o4-mini": (1.1, 4.4), "gpt-4.1": (2, 8), "gpt-4.1-mini": (0.4, 1.6),
+    "gpt-4.1-nano": (0.1, 0.4), "gpt-4o": (2.5, 10), "gpt-4o-mini": (0.15, 0.6),
+    "deepseek-chat": (0.27, 1.10), "deepseek-reasoner": (0.55, 2.19),
+    "claude-opus-4-6": (5, 25), "claude-sonnet-4-6": (3, 15), "claude-haiku-4-5": (1, 5),
+    "qwen3-max": (0.78, 3.9), "qwen3-plus": (0.26, 0.78), "qwen-max": (0.78, 3.9),
     "kimi-k2.5": (0.6, 3),
 }
 
 
+def _parse_xml_tool_calls(content: str) -> list[ToolCall]:
+    """Parse XML-style tool calls like <function=name><parameter=key>value</parameter></function>"""
+    tool_calls = []
+    
+    function_pattern = r'<function=([^>]+)>(.*?)</function>'
+    function_matches = re.findall(function_pattern, content, re.DOTALL)
+    
+    for func_name, params_content in function_matches:
+        tool_id = f"call_{len(tool_calls)}_{int(time.time() * 1000)}"
+        arguments = {}
+        
+        param_pattern = r'<parameter=([^>]+)>(.*?)</parameter>'
+        param_matches = re.findall(param_pattern, params_content, re.DOTALL)
+        
+        for key, value in param_matches:
+            value = value.strip()
+            try:
+                arguments[key] = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                arguments[key] = value
+        
+        if not arguments:
+            simple_pattern = r'(\w+)=["\']?([^"\'\s>]+)["\']?'
+            for key, value in re.findall(simple_pattern, params_content):
+                try:
+                    arguments[key] = json.loads(value)
+                except (json.JSONDecodeError, ValueError):
+                    arguments[key] = value
+        
+        if arguments:
+            tool_calls.append(ToolCall(id=tool_id, name=func_name, arguments=arguments))
+    
+    return tool_calls
+
+
+def _clean_xml_tool_calls_from_content(content: str) -> str:
+    """Remove XML tool call blocks from content, leaving only the actual message."""
+    cleaned = re.sub(r'<function=[^>]+>.*?</function>', '', content, flags=re.DOTALL)
+    cleaned = re.sub(r'\n\s*\n+', '\n\n', cleaned).strip()
+    return cleaned
+
+
 class LLM:
-    def __init__(
-        self,
-        model: str,
-        api_key: str,
-        base_url: str | None = None,
-        **kwargs,
-    ):
+    def __init__(self, model: str, api_key: str | None = None, base_url: str | None = None, temperature: float = 0.7, max_tokens: int = 4096):
         self.model = model
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
-        self.extra = kwargs  # temperature, max_tokens, etc.
+        self.client = OpenAI(api_key=api_key or "dummy", base_url=base_url)
+        self.temperature = temperature
+        self.max_tokens = max_tokens
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
 
-    @property
-    def estimated_cost(self) -> float | None:
-        """Rough cost estimate in USD. Returns None if model not in pricing table."""
-        pricing = _PRICING.get(self.model)
-        if not pricing:
-            return None
-        input_rate, output_rate = pricing
-        return (
-            self.total_prompt_tokens * input_rate / 1_000_000
-            + self.total_completion_tokens * output_rate / 1_000_000
-        )
-
-    def chat(
-        self,
-        messages: list[dict],
-        tools: list[dict] | None = None,
-        on_token=None,
-    ) -> LLMResponse:
-        """Send messages, stream back response, handle tool calls."""
-        params: dict = {
-            "model": self.model,
-            "messages": messages,
-            "stream": True,
-            **self.extra,
-        }
-        if tools:
-            params["tools"] = tools
-
-        # stream_options is an OpenAI extension; not all providers support it
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, on_token=None) -> LLMResponse:
+        """Chat with the LLM, handling both OpenAI and local model formats."""
         try:
-            params["stream_options"] = {"include_usage": True}
-            stream = self._call_with_retry(params)
-        except Exception:
-            params.pop("stream_options", None)
-            stream = self._call_with_retry(params)
+            kwargs = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+            }
+            
+            if tools:
+                kwargs["tools"] = tools
+            
+            response = self.client.chat.completions.create(**kwargs)
+            choice = response.choices[0]
+            message = choice.message
+            
+            if response.usage:
+                self.total_prompt_tokens += response.usage.prompt_tokens
+                self.total_completion_tokens += response.usage.completion_tokens
+            
+            content = message.content or ""
+            prompt_tokens = response.usage.prompt_tokens if response.usage else 0
+            completion_tokens = response.usage.completion_tokens if response.usage else 0
+            tool_calls = []
+            
+            if message.tool_calls:
+                for tc in message.tool_calls:
+                    try:
+                        arguments = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        arguments = {}
+                    tool_calls.append(ToolCall(
+                        id=tc.id,
+                        name=tc.function.name,
+                        arguments=arguments
+                    ))
+            
+            if "<function=" in content or "<tool_call" in content:
+                parsed_tool_calls = _parse_xml_tool_calls(content)
+                content = _clean_xml_tool_calls_from_content(content)
+                tool_calls = parsed_tool_calls
+            
+            return LLMResponse(content, tool_calls, prompt_tokens, completion_tokens)
+            
+        except RateLimitError as e:
+            print(f"Rate limit error: {e}")
+            raise
+        except APITimeoutError as e:
+            print(f"Timeout error: {e}")
+            raise
+        except APIConnectionError as e:
+            print(f"Connection error: {e}")
+            raise
+        except APIError as e:
+            print(f"API error: {e}")
+            raise
 
-        content_parts: list[str] = []
-        tc_map: dict[int, dict] = {}  # index -> {id, name, arguments_str}
-        prompt_tok = 0
-        completion_tok = 0
-
-        for chunk in stream:
-            # usage info comes in the final chunk
-            if chunk.usage:
-                prompt_tok = chunk.usage.prompt_tokens
-                completion_tok = chunk.usage.completion_tokens
-
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-
-            # accumulate text
-            if delta.content:
-                content_parts.append(delta.content)
-                if on_token:
-                    on_token(delta.content)
-
-            # accumulate tool calls across chunks
-            if delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if idx not in tc_map:
-                        tc_map[idx] = {"id": "", "name": "", "args": ""}
-                    if tc_delta.id:
-                        tc_map[idx]["id"] = tc_delta.id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            tc_map[idx]["name"] = tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            tc_map[idx]["args"] += tc_delta.function.arguments
-
-        # parse accumulated tool calls
-        parsed: list[ToolCall] = []
-        for idx in sorted(tc_map):
-            raw = tc_map[idx]
-            try:
-                args = json.loads(raw["args"])
-            except (json.JSONDecodeError, KeyError):
-                args = {}
-            parsed.append(ToolCall(id=raw["id"], name=raw["name"], arguments=args))
-
-        self.total_prompt_tokens += prompt_tok
-        self.total_completion_tokens += completion_tok
-
-        return LLMResponse(
-            content="".join(content_parts),
-            tool_calls=parsed,
-            prompt_tokens=prompt_tok,
-            completion_tokens=completion_tok,
-        )
-
-    def _call_with_retry(self, params: dict, max_retries: int = 3):
-        """Retry on transient errors with exponential backoff."""
-        for attempt in range(max_retries):
-            try:
-                return self.client.chat.completions.create(**params)
-            except (RateLimitError, APITimeoutError, APIConnectionError) as e:
-                if attempt == max_retries - 1:
-                    raise
-                wait = 2 ** attempt
-                time.sleep(wait)
-            except APIError as e:
-                # 5xx = server error, retry; 4xx = client error, don't
-                if e.status_code and e.status_code >= 500 and attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                else:
-                    raise
+    @property
+    def estimated_cost(self):
+        """Estimate cost based on token usage."""
+        if self.model not in _PRICING:
+            return None
+        input_cost, output_cost = _PRICING[self.model]
+        return (self.total_prompt_tokens * input_cost + self.total_completion_tokens * output_cost) / 1_000_000
