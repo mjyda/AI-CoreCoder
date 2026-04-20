@@ -97,23 +97,24 @@ def main():
 def _run_once(agent: Agent, prompt: str):
     """Non-interactive: run one prompt and exit."""
     def on_token(tok):
-        print(tok, end="", flush=True)
+        # Use Rich console for consistent formatting
+        console.print(tok, end="")
 
     def on_tool(name, kwargs):
-        console.print(f"\n[dim]> {name}({_brief(kwargs)})[/dim]")
+        console.print(f"\n[dim]$ {name}({_brief(kwargs)})[/dim]")
 
     agent.chat(prompt, on_token=on_token, on_tool=on_tool)
-    print()
+    console.print()
 
 
 def _repl(agent: Agent, config: Config):
     """Interactive read-eval-print loop."""
     console.print(Panel(
-        f"[bold]CoreCoder[/bold] v{__version__}\n"
-        f"Model: [cyan]{config.model}[/cyan]"
-        + (f"  Base: [dim]{config.base_url}[/dim]" if config.base_url else "")
-        + "\nType [bold]/help[/bold] for commands, [bold]Ctrl+C[/bold] to cancel, [bold]quit[/bold] to exit.",
-        border_style="blue",
+        f"[bold cyan]$ CoreCoder[/bold cyan] v{__version__}\n"
+        f"[bold cyan]$ Model:[/bold cyan] [cyan]{config.model}[/cyan]"
+        + (f"  [bold cyan]$ Base:[/bold cyan] [cyan]{config.base_url}[/cyan]" if config.base_url else "")
+        + "\n[bold cyan]$ Type /help for commands, Ctrl+C to cancel, quit to exit.[/bold cyan]",
+        border_style="cyan",
     ))
 
     hist_path = os.path.expanduser("~/.corecoder_history")
@@ -144,6 +145,36 @@ def _repl(agent: Agent, config: Config):
             break
 
         if not user_input:
+            continue
+
+        # Special handling for capability questions
+        if user_input in ("你能做什么", "你能干什么", "what can you do", "what are your capabilities"):
+            console.print(Panel(
+                "[bold cyan]$ 我能做的主要工作:[/bold cyan]\n"
+                "[bold cyan]$ 编程与代码编写:[/bold cyan]\n"
+                "  • 根据需求编写新代码\n"
+                "  • 修改和优化现有代码\n"
+                "  • 代码重构和改进\n"
+                "  • 解释复杂代码逻辑\n"
+                "\n"
+                "[bold cyan]$ 代码分析与调试:[/bold cyan]\n"
+                "  • 查找和修复bug\n"
+                "  • 代码审查\n"
+                "  • 性能优化建议\n"
+                "  • 错误排查\n"
+                "\n"
+                "[bold cyan]$ 项目管理:[/bold cyan]\n"
+                "  • 文件和目录操作\n"
+                "  • 代码搜索和定位\n"
+                "  • 依赖管理和包安装\n"
+                "  • 测试运行和调试\n"
+                "\n"
+                "[bold cyan]$ 开发工具集成:[/bold cyan]\n"
+                "  • Git操作（提交、拉取、合并等）\n"
+                "  • 命令行执行\n"
+                "  • 多语言支持（Python, JavaScript, TypeScript, Java等）",
+                border_style="cyan",
+            ))
             continue
 
         # built-in commands
@@ -180,7 +211,7 @@ def _repl(agent: Agent, config: Config):
             compressed = agent.context.maybe_compress(agent.messages, agent.llm)
             after = estimate_tokens(agent.messages)
             if compressed:
-                console.print(f"[green]Compressed: {before} → {after} tokens ({len(agent.messages)} messages)[/green]")
+                console.print(f"[green]Compressed: {before} -> {after} tokens ({len(agent.messages)} messages)[/green]")
             else:
                 console.print(f"[dim]Nothing to compress ({before} tokens, {len(agent.messages)} messages)[/dim]")
             continue
@@ -210,20 +241,78 @@ def _repl(agent: Agent, config: Config):
         # call the agent
         streamed: list[str] = []
 
+        # Code block state
+        in_code_block = False
+        code_buffer = []
+        # Non-code content buffer
+        text_buffer = []
+
         def on_token(tok):
+            nonlocal in_code_block, code_buffer, text_buffer
             streamed.append(tok)
-            print(tok, end="", flush=True)
+
+            # If token contains backtick markers, we need to handle state changes
+            if "```" in tok:
+                # Process token character by character to handle state changes properly
+                result = ""
+                i = 0
+                while i < len(tok):
+                    if tok[i:i+3] == "```":
+                        # Found backtick marker
+                        if in_code_block:
+                            # Exiting code block - display buffered code in a cyan panel
+                            if code_buffer:
+                                code_text = "".join(code_buffer)
+                                console.print(Panel(code_text, title="Code", border_style="cyan"))
+                                code_buffer.clear()
+                            result += "```"
+                            in_code_block = False
+                        else:
+                            # Entering code block - display buffered text in a green panel
+                            if text_buffer:
+                                text_content = "".join(text_buffer)
+                                if text_content.strip():
+                                    console.print(Panel(text_content, title="Response", border_style="green"))
+                                text_buffer.clear()
+                            result += "```"
+                            in_code_block = True
+                        i += 3
+                    else:
+                        result += tok[i]
+                        i += 1
+                console.print(result, end="")
+            else:
+                # No backticks in this token
+                if in_code_block:
+                    # Buffer code content to apply cyan color
+                    code_buffer.append(tok)
+                else:
+                    # Buffer text content for panel display
+                    text_buffer.append(tok)
 
         def on_tool(name, kwargs):
-            console.print(f"\n[dim]> {name}({_brief(kwargs)})[/dim]")
+            console.print(f"\n[dim]$ {name}({_brief(kwargs)})[/dim]")
 
         try:
             response = agent.chat(user_input, on_token=on_token, on_tool=on_tool)
             if streamed:
-                print()  # newline after streamed tokens
+                # Ensure we reset code block color if still in a block
+                if in_code_block:
+                    if code_buffer:
+                        code_text = "".join(code_buffer)
+                        console.print(Panel(code_text, title="Code", border_style="cyan"))
+                        code_buffer.clear()
+                    in_code_block = False
+                # Display any remaining text buffer
+                if text_buffer:
+                    text_content = "".join(text_buffer)
+                    if text_content.strip():
+                        console.print(Panel(text_content, title="Response", border_style="green"))
+                    text_buffer.clear()
+                console.print()  # newline after streamed tokens
             else:
                 # response wasn't streamed (came after tool calls)
-                console.print(Markdown(response))
+                console.print(Panel(response, title="Response", border_style="green"))
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted.[/yellow]")
         except Exception as e:
@@ -232,7 +321,7 @@ def _repl(agent: Agent, config: Config):
 
 def _show_help():
     console.print(Panel(
-        "[bold]Commands:[/bold]\n"
+        "[bold cyan]$ Commands:[/bold cyan]\n"
         "  /help          Show this help\n"
         "  /reset         Clear conversation history\n"
         "  /model         Show current model\n"
@@ -244,11 +333,11 @@ def _show_help():
         "  /sessions      List saved sessions\n"
         "  quit           Exit CoreCoder\n"
         "\n"
-        "[bold]Input:[/bold]\n"
+        "[bold cyan]$ Input:[/bold cyan]\n"
         "  Enter          Submit message\n"
-        "  Esc+Enter      Insert newline (for pasting code)",
+        "  Esc+Enter      Insert newline (for pasting code blocks)",
         title="CoreCoder Help",
-        border_style="dim",
+        border_style="cyan",
     ))
 
 

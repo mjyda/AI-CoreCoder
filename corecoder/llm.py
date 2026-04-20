@@ -87,11 +87,12 @@ def _clean_xml_tool_calls_from_content(content: str) -> str:
 
 
 class LLM:
-    def __init__(self, model: str, api_key: str | None = None, base_url: str | None = None, temperature: float = 0.7, max_tokens: int = 4096):
+    def __init__(self, model: str, api_key: str | None = None, base_url: str | None = None, temperature: float = 0.7, max_tokens: int = 4096, timeout: int = 60):
         self.model = model
-        self.client = OpenAI(api_key=api_key or "dummy", base_url=base_url)
+        self.client = OpenAI(api_key=api_key or "dummy", base_url=base_url, timeout=timeout)
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.timeout = timeout
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
 
@@ -108,37 +109,112 @@ class LLM:
             if tools:
                 kwargs["tools"] = tools
             
+            # Always try streaming if on_token provided
+            if on_token:
+                kwargs["stream"] = True
+            
             response = self.client.chat.completions.create(**kwargs)
-            choice = response.choices[0]
-            message = choice.message
             
-            if response.usage:
-                self.total_prompt_tokens += response.usage.prompt_tokens
-                self.total_completion_tokens += response.usage.completion_tokens
-            
-            content = message.content or ""
-            prompt_tokens = response.usage.prompt_tokens if response.usage else 0
-            completion_tokens = response.usage.completion_tokens if response.usage else 0
-            tool_calls = []
-            
-            if message.tool_calls:
-                for tc in message.tool_calls:
-                    try:
-                        arguments = json.loads(tc.function.arguments)
-                    except json.JSONDecodeError:
-                        arguments = {}
-                    tool_calls.append(ToolCall(
-                        id=tc.id,
-                        name=tc.function.name,
-                        arguments=arguments
-                    ))
-            
-            if "<function=" in content or "<tool_call" in content:
-                parsed_tool_calls = _parse_xml_tool_calls(content)
-                content = _clean_xml_tool_calls_from_content(content)
-                tool_calls = parsed_tool_calls
-            
-            return LLMResponse(content, tool_calls, prompt_tokens, completion_tokens)
+            if on_token and kwargs.get("stream"):
+                # Streaming mode - handle both text and potential tool calls
+                content = ""
+                tool_calls = []
+                tool_call_buffer = {}
+                
+                for chunk in response:
+                    if not chunk.choices:
+                        continue
+                    
+                    delta = chunk.choices[0].delta
+                    if not delta:
+                        continue
+                    
+                    # Check for tool calls in delta
+                    if hasattr(delta, 'tool_calls') and delta.tool_calls:
+                        for tc_chunk in delta.tool_calls:
+                            if not hasattr(tc_chunk, 'index'):
+                                continue
+                            idx = tc_chunk.index
+                            if idx not in tool_call_buffer:
+                                tool_call_buffer[idx] = {"id": "", "name": "", "arguments": ""}
+                            
+                            if hasattr(tc_chunk, 'id') and tc_chunk.id:
+                                tool_call_buffer[idx]["id"] = tc_chunk.id
+                            if hasattr(tc_chunk.function, 'name') and tc_chunk.function.name:
+                                tool_call_buffer[idx]["name"] = tc_chunk.function.name
+                            if hasattr(tc_chunk.function, 'arguments') and tc_chunk.function.arguments:
+                                tool_call_buffer[idx]["arguments"] += tc_chunk.function.arguments
+                    
+                    # Handle text content
+                    if hasattr(delta, 'content') and delta.content:
+                        token = delta.content
+                        content += token
+                        on_token(token)
+                
+                # If we detected tool calls, parse them
+                if tool_call_buffer:
+                    for idx, tc_data in sorted(tool_call_buffer.items()):
+                        try:
+                            arguments = json.loads(tc_data["arguments"]) if tc_data["arguments"] else {}
+                        except json.JSONDecodeError:
+                            arguments = {}
+                        tool_calls.append(ToolCall(
+                            id=tc_data["id"] or f"call_{idx}",
+                            name=tc_data["name"],
+                            arguments=arguments
+                        ))
+                
+                # Get usage if available
+                prompt_tokens = 0
+                completion_tokens = 0
+                if hasattr(response, 'usage') and response.usage:
+                    self.total_prompt_tokens += response.usage.prompt_tokens or 0
+                    self.total_completion_tokens += response.usage.completion_tokens or 0
+                    prompt_tokens = response.usage.prompt_tokens or 0
+                    completion_tokens = response.usage.completion_tokens or 0
+                
+                # Check for XML-style tool calls in content
+                if "<function=" in content or "<tool_call" in content:
+                    parsed_tool_calls = _parse_xml_tool_calls(content)
+                    content = _clean_xml_tool_calls_from_content(content)
+                    tool_calls = parsed_tool_calls
+                
+                return LLMResponse(content, tool_calls, prompt_tokens, completion_tokens)
+            else:
+                # Non-streaming mode
+                if hasattr(response, 'choices'):
+                    choice = response.choices[0]
+                    message = choice.message
+                else:
+                    message = response
+                
+                if hasattr(response, 'usage') and response.usage:
+                    self.total_prompt_tokens += response.usage.prompt_tokens
+                    self.total_completion_tokens += response.usage.completion_tokens
+                
+                content = message.content or "" if hasattr(message, 'content') else ""
+                prompt_tokens = response.usage.prompt_tokens if hasattr(response, 'usage') and response.usage else 0
+                completion_tokens = response.usage.completion_tokens if hasattr(response, 'usage') and response.usage else 0
+                tool_calls = []
+                
+                if hasattr(message, 'tool_calls') and message.tool_calls:
+                    for tc in message.tool_calls:
+                        try:
+                            arguments = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError:
+                            arguments = {}
+                        tool_calls.append(ToolCall(
+                            id=tc.id if hasattr(tc, 'id') else f"call_{len(tool_calls)}",
+                            name=tc.function.name,
+                            arguments=arguments
+                        ))
+                
+                if "<function=" in content or "<tool_call" in content:
+                    parsed_tool_calls = _parse_xml_tool_calls(content)
+                    content = _clean_xml_tool_calls_from_content(content)
+                    tool_calls = parsed_tool_calls
+                
+                return LLMResponse(content, tool_calls, prompt_tokens, completion_tokens)
             
         except RateLimitError as e:
             print(f"Rate limit error: {e}")
