@@ -53,7 +53,7 @@ class Agent:
             resp = self.llm.chat(
                 messages=self._full_messages(),
                 tools=self._tool_schemas(),
-                on_token=on_token,
+                on_token=on_token
             )
 
             # no tool calls -> LLM is done, return text
@@ -87,6 +87,47 @@ class Agent:
 
             # compress if tool outputs are big
             self.context.maybe_compress(self.messages, self.llm)
+
+        return "(reached maximum tool-call rounds)"
+
+    def chat_with_xml_tools(self, user_input: str, on_token=None, on_tool=None) -> str:
+        """Process user message with XML-based tool calling for models that don't support native tools."""
+        self.messages.append({"role": "user", "content": user_input})
+        self.context.maybe_compress(self.messages, self.llm)
+
+        for _ in range(self.max_rounds):
+            resp = self.llm.chat(
+                messages=self._full_messages(),
+                on_token=on_token
+            )
+
+            # Check for XML tool calls in the content
+            if resp.tool_calls:
+                self.messages.append(resp.message)
+                
+                if len(resp.tool_calls) == 1:
+                    tc = resp.tool_calls[0]
+                    if on_tool:
+                        on_tool(tc.name, tc.arguments)
+                    result = self._exec_tool(tc)
+                    self.messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    })
+                else:
+                    results = self._exec_tools_parallel(resp.tool_calls, on_tool)
+                    for tc, result in zip(resp.tool_calls, results):
+                        self.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result,
+                        })
+                
+                self.context.maybe_compress(self.messages, self.llm)
+            else:
+                self.messages.append(resp.message)
+                return resp.content
 
         return "(reached maximum tool-call rounds)"
 

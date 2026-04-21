@@ -96,7 +96,7 @@ class LLM:
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None, on_token=None) -> LLMResponse:
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, on_token=None, tool_choice=None) -> LLMResponse:
         """Chat with the LLM, handling both OpenAI and local model formats."""
         try:
             kwargs = {
@@ -106,11 +106,11 @@ class LLM:
                 "max_tokens": self.max_tokens,
             }
             
-            if tools:
-                # vLLM requires --enable-auto-tool-choice and --tool-call-parser
-                # Since your vLLM doesn't support these, we skip sending tools
-                # kwargs["tools"] = tools
-                pass
+            # Note: vLLM requires --enable-auto-tool-choice and --tool-call-parser
+            # to support tools. Since your vLLM doesn't have these, we skip sending tools.
+            # The model will still work but won't be able to call tools automatically.
+            # if tools:
+            #     kwargs["tools"] = tools
             
             # Always try streaming if on_token provided
             if on_token:

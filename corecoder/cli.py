@@ -113,7 +113,8 @@ def _run_once(agent: Agent, prompt: str):
     def on_tool(name, kwargs):
         print(f"\n$ {name}({_brief(kwargs)})")
 
-    agent.chat(prompt, on_token=on_token, on_tool=on_tool)
+    # Use XML-based tool calling for local models
+    agent.chat_with_xml_tools(prompt, on_token=on_token, on_tool=on_tool)
     print()
 
 
@@ -304,7 +305,8 @@ def _repl(agent: Agent, config: Config):
             console.print(f"\n[dim]$ {name}({_brief(kwargs)})[/dim]")
 
         try:
-            response = agent.chat(user_input, on_token=on_token, on_tool=on_tool)
+            # Use XML-based tool calling for local models
+            response = agent.chat_with_xml_tools(user_input, on_token=on_token, on_tool=on_tool)
             if streamed:
                 # Ensure we reset code block color if still in a block
                 if in_code_block:
