@@ -13,6 +13,7 @@ if sys.platform == 'win32':
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.live import Live
 from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -177,7 +178,7 @@ def _repl(agent: Agent, config: Config):
         event.current_buffer.insert_text("\n")
 
     validate_output = True
-    stream_output = False
+    stream_mode = "off"  # off | on | raw-only
 
     while True:
         try:
@@ -309,27 +310,33 @@ def _repl(agent: Agent, config: Config):
         if user_input == "/stream" or user_input.startswith("/stream "):
             arg = user_input[len("/stream"):].strip().lower()
             if not arg:
-                state = "on" if stream_output else "off"
-                console.print(f"Streaming output is [cyan]{state}[/cyan]")
+                console.print(f"Streaming output mode is [cyan]{stream_mode}[/cyan]")
                 continue
-            if arg in ("on", "off"):
-                stream_output = (arg == "on")
+            if arg in ("on", "off", "raw-only"):
+                stream_mode = arg
                 console.print(f"Streaming output switched [cyan]{arg}[/cyan]")
             else:
-                console.print("[yellow]Usage: /stream on|off[/yellow]")
+                console.print("[yellow]Usage: /stream on|off|raw-only[/yellow]")
             continue
 
         # call the agent
         streamed_tokens: list[str] = []
+        stream_live: Live | None = None
 
         def on_token(tok):
+            nonlocal stream_live
             streamed_tokens.append(tok)
-            if stream_output:
-                try:
-                    print(tok, end="", flush=True)
-                except UnicodeEncodeError:
-                    safe_tok = tok.encode("gbk", errors="replace").decode("gbk")
-                    print(safe_tok, end="", flush=True)
+            if stream_mode != "off":
+                if stream_live is None:
+                    stream_live = Live(
+                        Panel("", title="Streaming Response", border_style="blue"),
+                        console=console,
+                        refresh_per_second=20,
+                        transient=False,
+                    )
+                    stream_live.start()
+                current = "".join(streamed_tokens)
+                stream_live.update(Panel(current, title="Streaming Response", border_style="blue"))
 
         def on_tool(name, kwargs):
             console.print(f"\n[dim]$ {name}({_brief(kwargs)})[/dim]")
@@ -338,27 +345,29 @@ def _repl(agent: Agent, config: Config):
             # Use XML-based tool calling for local models
             response = agent.chat_with_xml_tools(user_input, on_token=on_token, on_tool=on_tool)
             raw_response = "".join(streamed_tokens).strip() if streamed_tokens else response
-            if stream_output and raw_response:
-                console.print()
+            if stream_live is not None:
+                stream_live.stop()
+                stream_live = None
 
             if validate_output:
-                cleaned = _sanitize_final_output(raw_response)
-                should_enforce_headings = _should_enforce_structured_output(user_input)
-                if should_enforce_headings and not _has_required_headings(cleaned):
-                    rewrite_prompt = _build_rewrite_prompt(cleaned)
-                    rewrite = agent.chat_with_xml_tools(rewrite_prompt, on_token=None, on_tool=on_tool)
-                    cleaned = _sanitize_final_output(rewrite)
-                    if not _has_required_headings(cleaned):
-                        missing = _missing_headings(cleaned)
-                        cleaned = (
-                            "[输出校验未通过]\n"
-                            f"缺失固定标题: {', '.join(missing)}\n\n"
-                            + cleaned
-                        )
-                panel_title = "Sanitized Response" if stream_output else "Response"
-                console.print(Panel(cleaned, title=panel_title, border_style="green"))
+                if stream_mode != "raw-only":
+                    cleaned = _sanitize_final_output(raw_response)
+                    should_enforce_headings = _should_enforce_structured_output(user_input)
+                    if should_enforce_headings and not _has_required_headings(cleaned):
+                        rewrite_prompt = _build_rewrite_prompt(cleaned)
+                        rewrite = agent.chat_with_xml_tools(rewrite_prompt, on_token=None, on_tool=on_tool)
+                        cleaned = _sanitize_final_output(rewrite)
+                        if not _has_required_headings(cleaned):
+                            missing = _missing_headings(cleaned)
+                            cleaned = (
+                                "[输出校验未通过]\n"
+                                f"缺失固定标题: {', '.join(missing)}\n\n"
+                                + cleaned
+                            )
+                    panel_title = "Sanitized Response" if stream_mode != "off" else "Response"
+                    console.print(Panel(cleaned, title=panel_title, border_style="green"))
             else:
-                if not stream_output:
+                if stream_mode != "raw-only":
                     console.print(Panel(raw_response, title="Response (raw)", border_style="yellow"))
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted.[/yellow]")
@@ -380,7 +389,7 @@ def _show_help():
         "  /sessions      List saved sessions\n"
         "  /skills        Show loaded skills\n"
         "  /validate-output on|off  Toggle output sanitizer/validator\n"
-        "  /stream on|off  Toggle token-by-token streaming display\n"
+        "  /stream on|off|raw-only  Toggle streaming mode\n"
         "  quit           Exit CoreCoder\n"
         "\n"
         "[bold cyan]$ Input:[/bold cyan]\n"
