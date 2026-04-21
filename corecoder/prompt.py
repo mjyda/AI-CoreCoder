@@ -4,12 +4,12 @@ import os
 import platform
 
 
-def system_prompt(tools) -> str:
+def system_prompt(tools, skills_block: str = "") -> str:
     cwd = os.getcwd()
     tool_list = "\n".join(f"• {t.name}: {t.description}" for t in tools)
     uname = platform.uname()
 
-    return f"""\
+    base = f"""\
 You are CoreCoder, an AI coding assistant running in the user's terminal.
 You help with software engineering: writing code, fixing bugs, refactoring, explaining code, running commands, and more.
 
@@ -49,3 +49,6 @@ When introducing yourself or listing your capabilities, use the following format
 - Focus on practical capabilities and examples
 - When asked "你能做什么" or "What can you do", provide a brief introduction followed by your main capabilities grouped by category
 """
+    if skills_block:
+        base += f"\n\n# Loaded Skills\n{skills_block}\n"
+    return base

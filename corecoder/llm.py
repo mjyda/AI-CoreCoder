@@ -115,6 +115,8 @@ class LLM:
             # Always try streaming if on_token provided
             if on_token:
                 kwargs["stream"] = True
+                # Ask server to include usage in streaming chunks when supported.
+                kwargs["stream_options"] = {"include_usage": True}
             
             response = self.client.chat.completions.create(**kwargs)
             
@@ -123,8 +125,15 @@ class LLM:
                 content = ""
                 tool_calls = []
                 tool_call_buffer = {}
+                prompt_tokens = 0
+                completion_tokens = 0
                 
                 for chunk in response:
+                    # Usage may appear in a final chunk for compatible providers.
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        prompt_tokens = chunk.usage.prompt_tokens or prompt_tokens
+                        completion_tokens = chunk.usage.completion_tokens or completion_tokens
+
                     if not chunk.choices:
                         continue
                     
@@ -167,14 +176,9 @@ class LLM:
                             arguments=arguments
                         ))
                 
-                # Get usage if available
-                prompt_tokens = 0
-                completion_tokens = 0
-                if hasattr(response, 'usage') and response.usage:
-                    self.total_prompt_tokens += response.usage.prompt_tokens or 0
-                    self.total_completion_tokens += response.usage.completion_tokens or 0
-                    prompt_tokens = response.usage.prompt_tokens or 0
-                    completion_tokens = response.usage.completion_tokens or 0
+                # Update cumulative counters after streaming loop.
+                self.total_prompt_tokens += prompt_tokens
+                self.total_completion_tokens += completion_tokens
                 
                 # Check for XML-style tool calls in content
                 if "<function=" in content or "<tool_call" in content:
@@ -192,8 +196,8 @@ class LLM:
                     message = response
                 
                 if hasattr(response, 'usage') and response.usage:
-                    self.total_prompt_tokens += response.usage.prompt_tokens
-                    self.total_completion_tokens += response.usage.completion_tokens
+                    self.total_prompt_tokens += response.usage.prompt_tokens or 0
+                    self.total_completion_tokens += response.usage.completion_tokens or 0
                 
                 content = message.content or "" if hasattr(message, 'content') else ""
                 prompt_tokens = response.usage.prompt_tokens if hasattr(response, 'usage') and response.usage else 0

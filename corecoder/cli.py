@@ -3,6 +3,7 @@
 import sys
 import os
 import argparse
+import re
 
 # Fix Windows encoding issues
 if sys.platform == 'win32':
@@ -20,9 +21,41 @@ from .agent import Agent
 from .llm import LLM
 from .config import Config
 from .session import save_session, load_session, list_sessions
+from .skills import load_skills
 from . import __version__
 
 console = Console(force_terminal=True)
+_FIXED_HEADINGS = [
+    "已实现功能",
+    "项目结构摘要",
+    "实际执行命令",
+    "验证结果",
+    "已知限制",
+    "下一步建议",
+    "协作编排执行记录",
+]
+_TASK_INTENT_KEYWORDS = (
+    "总结",
+    "总结一下",
+    "报告",
+    "交付",
+    "实现",
+    "开发",
+    "构建",
+    "重构",
+    "修复",
+    "测试",
+    "审查",
+    "review",
+    "summary",
+    "deliver",
+    "implement",
+    "build",
+    "refactor",
+    "fix",
+    "test",
+    "audit",
+)
 
 
 def _parse_args():
@@ -74,7 +107,8 @@ def main():
         temperature=config.temperature,
         max_tokens=config.max_tokens,
     )
-    agent = Agent(llm=llm, max_context_tokens=config.max_context_tokens)
+    skills = load_skills()
+    agent = Agent(llm=llm, skills=skills, max_context_tokens=config.max_context_tokens)
 
     # resume saved session
     if args.resume:
@@ -141,6 +175,9 @@ def _repl(agent: Agent, config: Config):
     @kb.add("escape", "enter")
     def _newline(event):
         event.current_buffer.insert_text("\n")
+
+    validate_output = True
+    stream_output = False
 
     while True:
         try:
@@ -248,58 +285,51 @@ def _repl(agent: Agent, config: Config):
                 for s in sessions:
                     console.print(f"  [cyan]{s['id']}[/cyan] ({s['model']}, {s['saved_at']}) {s['preview']}")
             continue
+        if user_input == "/skills":
+            if not agent.skills:
+                console.print("[dim]No skills loaded. Add .cursor/skills/<name>/SKILL.md or ~/.cursor/skills/<name>/SKILL.md[/dim]")
+            else:
+                console.print(f"[bold]Loaded skills ({len(agent.skills)}):[/bold]")
+                for s in agent.skills:
+                    desc = f" - {s.description}" if s.description else ""
+                    console.print(f"  [cyan]{s.name}[/cyan]{desc}")
+            continue
+        if user_input == "/validate-output" or user_input.startswith("/validate-output "):
+            arg = user_input[len("/validate-output"):].strip().lower()
+            if not arg:
+                state = "on" if validate_output else "off"
+                console.print(f"Output validation is [cyan]{state}[/cyan]")
+                continue
+            if arg in ("on", "off"):
+                validate_output = (arg == "on")
+                console.print(f"Output validation switched [cyan]{arg}[/cyan]")
+            else:
+                console.print("[yellow]Usage: /validate-output on|off[/yellow]")
+            continue
+        if user_input == "/stream" or user_input.startswith("/stream "):
+            arg = user_input[len("/stream"):].strip().lower()
+            if not arg:
+                state = "on" if stream_output else "off"
+                console.print(f"Streaming output is [cyan]{state}[/cyan]")
+                continue
+            if arg in ("on", "off"):
+                stream_output = (arg == "on")
+                console.print(f"Streaming output switched [cyan]{arg}[/cyan]")
+            else:
+                console.print("[yellow]Usage: /stream on|off[/yellow]")
+            continue
 
         # call the agent
-        streamed: list[str] = []
-
-        # Code block state
-        in_code_block = False
-        code_buffer = []
-        # Non-code content buffer
-        text_buffer = []
+        streamed_tokens: list[str] = []
 
         def on_token(tok):
-            nonlocal in_code_block, code_buffer, text_buffer
-            streamed.append(tok)
-
-            # If token contains backtick markers, we need to handle state changes
-            if "```" in tok:
-                # Process token character by character to handle state changes properly
-                result = ""
-                i = 0
-                while i < len(tok):
-                    if tok[i:i+3] == "```":
-                        # Found backtick marker
-                        if in_code_block:
-                            # Exiting code block - display buffered code in a cyan panel
-                            if code_buffer:
-                                code_text = "".join(code_buffer)
-                                console.print(Panel(code_text, title="Code", border_style="cyan"))
-                                code_buffer.clear()
-                            result += "```"
-                            in_code_block = False
-                        else:
-                            # Entering code block - display buffered text in a green panel
-                            if text_buffer:
-                                text_content = "".join(text_buffer)
-                                if text_content.strip():
-                                    console.print(Panel(text_content, title="Response", border_style="green"))
-                                text_buffer.clear()
-                            result += "```"
-                            in_code_block = True
-                        i += 3
-                    else:
-                        result += tok[i]
-                        i += 1
-                console.print(result, end="")
-            else:
-                # No backticks in this token
-                if in_code_block:
-                    # Buffer code content to apply cyan color
-                    code_buffer.append(tok)
-                else:
-                    # Buffer text content for panel display
-                    text_buffer.append(tok)
+            streamed_tokens.append(tok)
+            if stream_output:
+                try:
+                    print(tok, end="", flush=True)
+                except UnicodeEncodeError:
+                    safe_tok = tok.encode("gbk", errors="replace").decode("gbk")
+                    print(safe_tok, end="", flush=True)
 
         def on_tool(name, kwargs):
             console.print(f"\n[dim]$ {name}({_brief(kwargs)})[/dim]")
@@ -307,24 +337,29 @@ def _repl(agent: Agent, config: Config):
         try:
             # Use XML-based tool calling for local models
             response = agent.chat_with_xml_tools(user_input, on_token=on_token, on_tool=on_tool)
-            if streamed:
-                # Ensure we reset code block color if still in a block
-                if in_code_block:
-                    if code_buffer:
-                        code_text = "".join(code_buffer)
-                        console.print(Panel(code_text, title="Code", border_style="cyan"))
-                        code_buffer.clear()
-                    in_code_block = False
-                # Display any remaining text buffer
-                if text_buffer:
-                    text_content = "".join(text_buffer)
-                    if text_content.strip():
-                        console.print(Panel(text_content, title="Response", border_style="green"))
-                    text_buffer.clear()
-                console.print()  # newline after streamed tokens
+            raw_response = "".join(streamed_tokens).strip() if streamed_tokens else response
+            if stream_output and raw_response:
+                console.print()
+
+            if validate_output:
+                cleaned = _sanitize_final_output(raw_response)
+                should_enforce_headings = _should_enforce_structured_output(user_input)
+                if should_enforce_headings and not _has_required_headings(cleaned):
+                    rewrite_prompt = _build_rewrite_prompt(cleaned)
+                    rewrite = agent.chat_with_xml_tools(rewrite_prompt, on_token=None, on_tool=on_tool)
+                    cleaned = _sanitize_final_output(rewrite)
+                    if not _has_required_headings(cleaned):
+                        missing = _missing_headings(cleaned)
+                        cleaned = (
+                            "[输出校验未通过]\n"
+                            f"缺失固定标题: {', '.join(missing)}\n\n"
+                            + cleaned
+                        )
+                panel_title = "Sanitized Response" if stream_output else "Response"
+                console.print(Panel(cleaned, title=panel_title, border_style="green"))
             else:
-                # response wasn't streamed (came after tool calls)
-                console.print(Panel(response, title="Response", border_style="green"))
+                if not stream_output:
+                    console.print(Panel(raw_response, title="Response (raw)", border_style="yellow"))
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted.[/yellow]")
         except Exception as e:
@@ -343,6 +378,9 @@ def _show_help():
         "  /diff          Show files modified this session\n"
         "  /save          Save session to disk\n"
         "  /sessions      List saved sessions\n"
+        "  /skills        Show loaded skills\n"
+        "  /validate-output on|off  Toggle output sanitizer/validator\n"
+        "  /stream on|off  Toggle token-by-token streaming display\n"
         "  quit           Exit CoreCoder\n"
         "\n"
         "[bold cyan]$ Input:[/bold cyan]\n"
@@ -356,3 +394,67 @@ def _show_help():
 def _brief(kwargs: dict, maxlen: int = 80) -> str:
     s = ", ".join(f"{k}={repr(v)[:40]}" for k, v in kwargs.items())
     return s[:maxlen] + ("..." if len(s) > maxlen else "")
+
+
+def _sanitize_final_output(text: str) -> str:
+    """Sanitize model output by stripping protocol tags and deduplicating paragraphs."""
+    lines = text.splitlines()
+    filtered: list[str] = []
+    tag_pat = re.compile(r"</?(tool_call|function|parameter)(?:[=>].*)?>")
+    for line in lines:
+        if tag_pat.search(line.strip()):
+            continue
+        if line.strip().startswith("<function=") or line.strip().startswith("<parameter="):
+            continue
+        filtered.append(line)
+
+    # Deduplicate repeated paragraphs while preserving order.
+    blocks = [b.strip() for b in "\n".join(filtered).split("\n\n")]
+    seen: set[str] = set()
+    unique_blocks: list[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        key = re.sub(r"\s+", " ", block).strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_blocks.append(block)
+    return "\n\n".join(unique_blocks).strip()
+
+
+def _normalize_heading(line: str) -> str:
+    return line.strip().lstrip("#").lstrip("-").strip()
+
+
+def _missing_headings(text: str) -> list[str]:
+    present = {_normalize_heading(line) for line in text.splitlines() if line.strip()}
+    return [h for h in _FIXED_HEADINGS if h not in present]
+
+
+def _has_required_headings(text: str) -> bool:
+    return not _missing_headings(text)
+
+
+def _build_rewrite_prompt(previous: str) -> str:
+    headings = "\n".join(f"- {h}" for h in _FIXED_HEADINGS)
+    return (
+        "请重写你上一条回复，并严格通过输出校验：\n"
+        "1) 不要包含任何 tool_call/function/parameter 协议标签；\n"
+        "2) 删除重复段落；\n"
+        "3) 仅使用以下7个固定标题且全部包含：\n"
+        f"{headings}\n"
+        "4) 标题外不要追加其它章节。\n\n"
+        "这是待重写内容：\n"
+        f"{previous}"
+    )
+
+
+def _should_enforce_structured_output(user_input: str) -> bool:
+    """Enable 7-section enforcement only for task/report-like prompts."""
+    text = user_input.strip().lower()
+    if not text:
+        return False
+    if text.startswith("/"):
+        return False
+    return any(k in text for k in _TASK_INTENT_KEYWORDS)
