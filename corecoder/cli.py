@@ -4,6 +4,11 @@ import sys
 import os
 import argparse
 
+# Fix Windows encoding issues
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -17,7 +22,7 @@ from .config import Config
 from .session import save_session, load_session, list_sessions
 from . import __version__
 
-console = Console()
+console = Console(force_terminal=True)
 
 
 def _parse_args():
@@ -97,14 +102,19 @@ def main():
 def _run_once(agent: Agent, prompt: str):
     """Non-interactive: run one prompt and exit."""
     def on_token(tok):
-        # Use Rich console for consistent formatting
-        console.print(tok, end="")
+        # Use plain print with UTF-8 encoding to avoid Windows issues
+        try:
+            print(tok, end="", flush=True)
+        except UnicodeEncodeError:
+            # Fallback: encode problematic characters
+            safe_tok = tok.encode('gbk', errors='replace').decode('gbk')
+            print(safe_tok, end="", flush=True)
 
     def on_tool(name, kwargs):
-        console.print(f"\n[dim]$ {name}({_brief(kwargs)})[/dim]")
+        print(f"\n$ {name}({_brief(kwargs)})")
 
     agent.chat(prompt, on_token=on_token, on_tool=on_tool)
-    console.print()
+    print()
 
 
 def _repl(agent: Agent, config: Config):

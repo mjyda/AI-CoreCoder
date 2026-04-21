@@ -107,7 +107,10 @@ class LLM:
             }
             
             if tools:
-                kwargs["tools"] = tools
+                # vLLM requires --enable-auto-tool-choice and --tool-call-parser
+                # Since your vLLM doesn't support these, we skip sending tools
+                # kwargs["tools"] = tools
+                pass
             
             # Always try streaming if on_token provided
             if on_token:
