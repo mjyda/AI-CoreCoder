@@ -80,7 +80,7 @@ def _unified_diff(old: str, new: str, filename: str, context: int = 3) -> str:
     diff = difflib.unified_diff(
         old_lines, new_lines,
         fromfile=f"a/{filename}", tofile=f"b/{filename}",
-        n=context,
+        n=context,#显示上下附近的三行内容
     )
     result = "".join(diff)
     # truncate enormous diffs

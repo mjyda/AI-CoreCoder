@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .llm import LLM
 
-
+#估算token的花费，对于混合英文和中文的内容，大约每3.5个字符算一个token
 def _approx_tokens(text: str) -> int:
     """Rough token count. ~3.5 chars/token for mixed en/zh content."""
     return len(text) // 3
@@ -41,7 +41,7 @@ class ContextManager:
         self._snip_at = int(max_tokens * 0.50)    # 50% -> snip tool outputs
         self._summarize_at = int(max_tokens * 0.70)  # 70% -> LLM summarize
         self._collapse_at = int(max_tokens * 0.90)   # 90% -> hard collapse
-
+#根据消息列表和语言模型，可能会应用压缩层。返回True如果发生了任何压缩。主函数的入口
     def maybe_compress(self, messages: list[dict], llm: LLM | None = None) -> bool:
         """Apply compression layers as needed. Returns True if any compression happened."""
         current = estimate_tokens(messages)
@@ -65,8 +65,8 @@ class ContextManager:
             compressed = True
 
         return compressed
-
-    @staticmethod
+#处理单条消息
+    @staticmethod#静态方法，不需要访问类的属性或方法，可以直接通过类名调用
     def _snip_tool_outputs(messages: list[dict]) -> bool:
         """Layer 1: Truncate tool results over 1500 chars to their first/last lines.
 
@@ -86,21 +86,21 @@ class ContextManager:
             # keep first 3 + last 3 lines
             snipped = (
                 "\n".join(lines[:3])
-                + f"\n... ({len(lines)} lines, snipped to save context) ...\n"
+                + f"\n... ({len(lines)} lines, snipped to save context) ...\n"#前三行,后三行，提示信息
                 + "\n".join(lines[-3:])
             )
-            m["content"] = snipped
-            changed = True
+            m["content"] = snipped#替换原来的内容
+            changed = True#有过修改，所以改为true
         return changed
 
     def _summarize_old(self, messages: list[dict], llm: LLM | None,
                        keep_recent: int = 8) -> bool:
         """Layer 2: Summarize old conversation, keep recent messages intact."""
-        if len(messages) <= keep_recent:
+        if len(messages) <= keep_recent:#检查是否需要压缩
             return False
-
-        old = messages[:-keep_recent]
-        tail = messages[-keep_recent:]
+#消息记录，老消息和新消息分开，老消息进行总结，新消息保持不变
+        old = messages[:-keep_recent]#前八条
+        tail = messages[-keep_recent:]#后八条
 
         summary = self._get_summary(old, llm)
 
@@ -121,7 +121,7 @@ class ContextManager:
         tail = messages[-4:] if len(messages) > 4 else messages[-2:]
         summary = self._get_summary(messages[:-len(tail)], llm)
 
-        messages.clear()
+        messages.clear()#清除内容，添加新的压缩后的内容，保留最后几条消息和总结信息
         messages.append({
             "role": "user",
             "content": f"[Hard context reset]\n{summary}",
@@ -130,7 +130,7 @@ class ContextManager:
             "role": "assistant",
             "content": "Context restored. Continuing from where we left off.",
         })
-        messages.extend(tail)
+        messages.extend(tail)#将 tail 列表中的所有元素逐个添加到 messages 列表的末尾
 
     def _get_summary(self, messages: list[dict], llm: LLM | None) -> str:
         """Generate summary via LLM or fallback to extraction."""
@@ -159,17 +159,18 @@ class ContextManager:
 
         # fallback: extract key lines
         return self._extract_key_info(messages)
-
+#生成对话的文本摘要，将消息列表扁平化为简单字符串，处理多条消息
     @staticmethod
     def _flatten(messages: list[dict]) -> str:
         parts = []
         for m in messages:
-            role = m.get("role", "?")
+            role = m.get("role", "?")#键值和默认值
             text = m.get("content", "") or ""
             if text:
                 parts.append(f"[{role}] {text[:400]}")
         return "\n".join(parts)
-
+    
+#当LLM不可用时，通过规则匹配从对话中提取关键信息，生成一个简单的文本摘要。
     @staticmethod
     def _extract_key_info(messages: list[dict]) -> str:
         """Fallback: extract file paths, errors, and decisions without LLM."""
@@ -180,7 +181,7 @@ class ContextManager:
 
         for m in messages:
             text = m.get("content", "") or ""
-            # extract file paths
+            # extract file paths，提取文件路径，text是被搜索的文本内容
             for match in re.finditer(r'[\w./\-]+\.\w{1,5}', text):
                 files_seen.add(match.group())
             # extract error lines

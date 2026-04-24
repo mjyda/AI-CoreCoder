@@ -32,7 +32,7 @@ class LLMResponse:
             ]
         return msg
 
-
+#模型定价表，单位是每百万tokens的美元价格，分别针对输入和输出tokens。请根据实际使用的模型和定价进行调整。
 _PRICING = {
     "gpt-5.4": (2.5, 15), "gpt-5.4-mini": (0.75, 4.5), "gpt-5.4-nano": (0.2, 1.25),
     "o4-mini": (1.1, 4.4), "gpt-4.1": (2, 8), "gpt-4.1-mini": (0.4, 1.6),
@@ -78,7 +78,7 @@ def _parse_xml_tool_calls(content: str) -> list[ToolCall]:
     
     return tool_calls
 
-
+#清除格式问题
 def _clean_xml_tool_calls_from_content(content: str) -> str:
     """Remove XML tool call blocks from content, leaving only the actual message."""
     cleaned = re.sub(r'<function=[^>]+>.*?</function>', '', content, flags=re.DOTALL)
@@ -117,9 +117,9 @@ class LLM:
                 kwargs["stream"] = True
                 # Ask server to include usage in streaming chunks when supported.
                 kwargs["stream_options"] = {"include_usage": True}
-            
+            #再次创建请求，子请求
             response = self.client.chat.completions.create(**kwargs)
-            
+            #流式输出
             if on_token and kwargs.get("stream"):
                 # Streaming mode - handle both text and potential tool calls
                 content = ""
@@ -147,7 +147,7 @@ class LLM:
                             if not hasattr(tc_chunk, 'index'):
                                 continue
                             idx = tc_chunk.index
-                            if idx not in tool_call_buffer:
+                            if idx not in tool_call_buffer:#空的，用于暂存
                                 tool_call_buffer[idx] = {"id": "", "name": "", "arguments": ""}
                             
                             if hasattr(tc_chunk, 'id') and tc_chunk.id:
@@ -155,15 +155,15 @@ class LLM:
                             if hasattr(tc_chunk.function, 'name') and tc_chunk.function.name:
                                 tool_call_buffer[idx]["name"] = tc_chunk.function.name
                             if hasattr(tc_chunk.function, 'arguments') and tc_chunk.function.arguments:
-                                tool_call_buffer[idx]["arguments"] += tc_chunk.function.arguments
+                                tool_call_buffer[idx]["arguments"] += tc_chunk.function.arguments#拼接分块的参数
                     
-                    # Handle text content
+                    # Handle text content，处理文本内容
                     if hasattr(delta, 'content') and delta.content:
                         token = delta.content
                         content += token
                         on_token(token)
                 
-                # If we detected tool calls, parse them
+                # If we detected tool calls, parse them 解析工具调用
                 if tool_call_buffer:
                     for idx, tc_data in sorted(tool_call_buffer.items()):
                         try:
@@ -179,7 +179,7 @@ class LLM:
                 # Update cumulative counters after streaming loop.
                 self.total_prompt_tokens += prompt_tokens
                 self.total_completion_tokens += completion_tokens
-                
+                #检测XML格式的内容
                 # Check for XML-style tool calls in content
                 if "<function=" in content or "<tool_call" in content:
                     parsed_tool_calls = _parse_xml_tool_calls(content)
@@ -235,7 +235,7 @@ class LLM:
         except APIError as e:
             print(f"API error: {e}")
             raise
-
+#进行匹配，输入和输出单价，计算总成本
     @property
     def estimated_cost(self):
         """Estimate cost based on token usage."""

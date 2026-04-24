@@ -30,7 +30,7 @@ class ReadFileTool(Tool):
     }
 
     def execute(self, file_path: str, offset: int = 1, limit: int = 2000) -> str:
-        try:
+        try:#从第几行开始读取，默认从第一行开始；最多读取多少行，默认2000行
             p = Path(file_path).expanduser().resolve()
             if not p.exists():
                 return f"Error: {file_path} not found"
@@ -40,10 +40,10 @@ class ReadFileTool(Tool):
             text = p.read_text(errors="replace")
             lines = text.splitlines()
             total = len(lines)
-
+            #保证切片索引至少为0，避免负数索引导致从后往前数行 
             start = max(0, offset - 1)
-            chunk = lines[start : start + limit]
-            numbered = [f"{start + i + 1}\t{ln}" for i, ln in enumerate(chunk)]
+            chunk = lines[start : start + limit]#切片获取指定范围的行，最多limit行
+            numbered = [f"{start + i + 1}\t{ln}" for i, ln in enumerate(chunk)]#计算行号
             result = "\n".join(numbered)
 
             if total > start + limit:

@@ -25,8 +25,8 @@ def _extract_frontmatter_field(text: str, field: str) -> str:
             break
         if ":" not in line:
             continue
-        key, value = line.split(":", 1)
-        if key.strip() == field:
+        key, value = line.split(":", 1)#按冒号分割，最多分割 1 次
+        if key.strip() == field:# field 就是要查找的字段名
             return value.strip().strip("'\"")
     return ""
 
@@ -60,7 +60,7 @@ def load_skills() -> list[Skill]:
             description = _extract_frontmatter_field(content, "description")
             if name in seen_names:
                 continue
-
+#如果存在同名技能，优先加载第一个发现的技能，后续同名技能将被忽略，没有就进行加入里面
             seen_names.add(name)
             found.append(
                 Skill(
@@ -73,7 +73,7 @@ def load_skills() -> list[Skill]:
 
     return found
 
-
+#将加载的技能列表格式化成适合嵌入系统提示的文本块
 def skills_prompt_block(skills: list[Skill]) -> str:
     """Build a compact prompt block with loaded skills."""
     if not skills:

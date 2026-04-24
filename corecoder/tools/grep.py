@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from .base import Tool
 
-# skip these dirs to avoid noise
+# skip these dirs to avoid noise  垃圾目录列表，避免搜索时出现太多无用的结果
 _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox", "dist", "build"}
 
 
@@ -38,15 +38,15 @@ class GrepTool(Tool):
             regex = re.compile(pattern)
         except re.error as e:
             return f"Invalid regex: {e}"
-
-        base = Path(path).expanduser().resolve()
+        #默认当前路径
+        base = Path(path).expanduser().resolve()#解析为绝对路径，消除 .. 和符号链接
         if not base.exists():
             return f"Error: {path} not found"
 
         if base.is_file():
             files = [base]
         else:
-            files = self._walk(base, include)
+            files = self._walk(base, include)# 递归遍历目录，返回符合条件的文件列表
 
         matches = []
         for fp in files:
@@ -65,11 +65,11 @@ class GrepTool(Tool):
 
     @staticmethod
     def _walk(root: Path, include: str | None) -> list[Path]:
-        """Walk dir tree, skipping junk dirs."""
-        results = []
+        """Walk dir tree, skipping junk dirs."""#路径和目录
+        results = []#递归遍历目录下的所有子目录和文件
         for item in root.rglob(include or "*"):
             # skip hidden/junk directories
-            if any(part in _SKIP_DIRS for part in item.parts):
+            if any(part in _SKIP_DIRS for part in item.parts):#检查路径中是否包含需要跳过的目录名 any()至少有一个为 True就返回 True
                 continue
             if item.is_file():
                 results.append(item)

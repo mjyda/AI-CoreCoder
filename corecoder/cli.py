@@ -13,11 +13,10 @@ if sys.platform == 'win32':
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.live import Live
 from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
-
+from rich.live import Live
 from .agent import Agent
 from .llm import LLM
 from .config import Config
@@ -76,8 +75,8 @@ def _parse_args():
 def main():
     args = _parse_args()
     config = Config.from_env()
-
-    # CLI args override env vars
+     
+    # CLI args override env vars 命令行优于环境变量设置
     if args.model:
         config.model = args.model
     if args.base_url:
@@ -85,6 +84,7 @@ def main():
     if args.api_key:
         config.api_key = args.api_key
 
+     #如果没有找到API密钥，提示用户设置环境变量并退出
     if not config.api_key:
         console.print("[red bold]No API key found.[/]")
         console.print(
@@ -100,7 +100,7 @@ def main():
             "  export OPENAI_API_KEY=ollama OPENAI_BASE_URL=http://localhost:11434/v1 CORECODER_MODEL=qwen2.5-coder\n"
         )
         sys.exit(1)
-
+     #程序异常退出时，显示错误信息 
     llm = LLM(
         model=config.model,
         api_key=config.api_key,
@@ -124,13 +124,13 @@ def main():
         else:
             console.print(f"[red]Session '{args.resume}' not found.[/red]")
             sys.exit(1)
-
-    # one-shot mode
+#这个过程进行加载数据的，如果找到和找不到的时候异常退出，并且显示错误信息
+    # one-shot mode，单词执行
     if args.prompt:
         _run_once(agent, args.prompt)
         return
 
-    # interactive REPL
+    # interactive REPL，交互式命令行界面
     _repl(agent, config)
 
 
@@ -147,12 +147,12 @@ def _run_once(agent: Agent, prompt: str):
 
     def on_tool(name, kwargs):
         print(f"\n$ {name}({_brief(kwargs)})")
-
+#这个函数表示在干什么，调用什么工具，并且把结果打印出来
     # Use XML-based tool calling for local models
     agent.chat_with_xml_tools(prompt, on_token=on_token, on_tool=on_tool)
     print()
 
-
+#交互式面板,就是运行之后的那个上面的显示，包括模型名称，版本号，提示信息等
 def _repl(agent: Agent, config: Config):
     """Interactive read-eval-print loop."""
     console.print(Panel(
@@ -162,13 +162,13 @@ def _repl(agent: Agent, config: Config):
         + "\n[bold cyan]$ Type /help for commands, Ctrl+C to cancel, quit to exit.[/bold cyan]",
         border_style="cyan",
     ))
-
+    #保存命令历史
     hist_path = os.path.expanduser("~/.corecoder_history")
     history = FileHistory(hist_path)
 
     # Enter submits, Escape+Enter inserts a newline (for pasting code blocks etc.)
     kb = KeyBindings()
-
+#绑定键盘，创建快捷键，Enter键提交输入，Escape+Enter插入换行符，适合粘贴代码块等多行输入的场景
     @kb.add("enter")
     def _submit(event):
         event.current_buffer.validate_and_handle()
@@ -176,10 +176,10 @@ def _repl(agent: Agent, config: Config):
     @kb.add("escape", "enter")
     def _newline(event):
         event.current_buffer.insert_text("\n")
-
+#控制是否验证输出，是否流式显示输出
     validate_output = True
-    stream_mode = "off"  # off | on | raw-only
-
+    stream_output = False
+#提示符，历史记录，键盘快捷操作绑定，多行输入，续行提示符
     while True:
         try:
             user_input = pt_prompt(
@@ -188,7 +188,7 @@ def _repl(agent: Agent, config: Config):
                 multiline=True,
                 key_bindings=kb,
                 prompt_continuation="...  ",
-            ).strip()
+            ).strip() #去除收尾空白
         except (EOFError, KeyboardInterrupt):
             console.print("\nBye!")
             break
@@ -222,7 +222,7 @@ def _repl(agent: Agent, config: Config):
                 "  • Git操作（提交、拉取、合并等）\n"
                 "  • 命令行执行\n"
                 "  • 多语言支持（Python, JavaScript, TypeScript, Java等）",
-                border_style="cyan",
+                border_style="cyan",#边框是青色
             ))
             continue
 
@@ -237,10 +237,10 @@ def _repl(agent: Agent, config: Config):
             console.print("[yellow]Conversation reset.[/yellow]")
             continue
         if user_input == "/tokens":
-            p = agent.llm.total_prompt_tokens
+            p = agent.llm.total_prompt_tokens#模型输入消耗，输出消耗
             c = agent.llm.total_completion_tokens
             line = f"Tokens: [cyan]{p}[/cyan] prompt + [cyan]{c}[/cyan] completion = [bold]{p+c}[/bold] total"
-            cost = agent.llm.estimated_cost
+            cost = agent.llm.estimated_cost#费用的估算
             if cost is not None:
                 line += f"  (~${cost:.4f})"
             console.print(line)
@@ -254,7 +254,7 @@ def _repl(agent: Agent, config: Config):
             else:
                 console.print(f"Current model: [cyan]{config.model}[/cyan]")
             continue
-        if user_input == "/compact":
+        if user_input == "/compact":#压缩对话历史信息
             from .context import estimate_tokens
             before = estimate_tokens(agent.messages)
             compressed = agent.context.maybe_compress(agent.messages, agent.llm)
@@ -264,12 +264,12 @@ def _repl(agent: Agent, config: Config):
             else:
                 console.print(f"[dim]Nothing to compress ({before} tokens, {len(agent.messages)} messages)[/dim]")
             continue
-        if user_input == "/save":
+        if user_input == "/save":#保存对话信息
             sid = save_session(agent.messages, config.model)
             console.print(f"[green]Session saved: {sid}[/green]")
             console.print(f"Resume with: corecoder -r {sid}")
             continue
-        if user_input == "/diff":
+        if user_input == "/diff":#显示当前会话中修改过的文件列表，只会显示通过工具函数修改过的文件，手动修改的文件不会被记录和显示
             from .tools.edit import _changed_files
             if not _changed_files:
                 console.print("[dim]No files modified this session.[/dim]")
@@ -310,33 +310,27 @@ def _repl(agent: Agent, config: Config):
         if user_input == "/stream" or user_input.startswith("/stream "):
             arg = user_input[len("/stream"):].strip().lower()
             if not arg:
-                console.print(f"Streaming output mode is [cyan]{stream_mode}[/cyan]")
+                state = "on" if stream_output else "off"
+                console.print(f"Streaming output is [cyan]{state}[/cyan]")
                 continue
-            if arg in ("on", "off", "raw-only"):
-                stream_mode = arg
+            if arg in ("on", "off"):
+                stream_output = (arg == "on")
                 console.print(f"Streaming output switched [cyan]{arg}[/cyan]")
             else:
-                console.print("[yellow]Usage: /stream on|off|raw-only[/yellow]")
+                console.print("[yellow]Usage: /stream on|off[/yellow]")
             continue
 
         # call the agent
         streamed_tokens: list[str] = []
-        stream_live: Live | None = None
 
         def on_token(tok):
-            nonlocal stream_live
             streamed_tokens.append(tok)
-            if stream_mode != "off":
-                if stream_live is None:
-                    stream_live = Live(
-                        Panel("", title="Streaming Response", border_style="blue"),
-                        console=console,
-                        refresh_per_second=20,
-                        transient=False,
-                    )
-                    stream_live.start()
-                current = "".join(streamed_tokens)
-                stream_live.update(Panel(current, title="Streaming Response", border_style="blue"))
+            if stream_output:
+                try:
+                    print(tok, end="", flush=True)#实时打印，不换行
+                except UnicodeEncodeError:
+                    safe_tok = tok.encode("gbk", errors="replace").decode("gbk")
+                    print(safe_tok, end="", flush=True)
 
         def on_tool(name, kwargs):
             console.print(f"\n[dim]$ {name}({_brief(kwargs)})[/dim]")
@@ -345,36 +339,34 @@ def _repl(agent: Agent, config: Config):
             # Use XML-based tool calling for local models
             response = agent.chat_with_xml_tools(user_input, on_token=on_token, on_tool=on_tool)
             raw_response = "".join(streamed_tokens).strip() if streamed_tokens else response
-            if stream_live is not None:
-                stream_live.stop()
-                stream_live = None
+            if stream_output and raw_response:#一个空行，更美观
+                console.print()
 
             if validate_output:
-                if stream_mode != "raw-only":
-                    cleaned = _sanitize_final_output(raw_response)
-                    should_enforce_headings = _should_enforce_structured_output(user_input)
-                    if should_enforce_headings and not _has_required_headings(cleaned):
-                        rewrite_prompt = _build_rewrite_prompt(cleaned)
-                        rewrite = agent.chat_with_xml_tools(rewrite_prompt, on_token=None, on_tool=on_tool)
-                        cleaned = _sanitize_final_output(rewrite)
-                        if not _has_required_headings(cleaned):
-                            missing = _missing_headings(cleaned)
-                            cleaned = (
-                                "[输出校验未通过]\n"
-                                f"缺失固定标题: {', '.join(missing)}\n\n"
-                                + cleaned
-                            )
-                    panel_title = "Sanitized Response" if stream_mode != "off" else "Response"
-                    console.print(Panel(cleaned, title=panel_title, border_style="green"))
+                cleaned = _sanitize_final_output(raw_response)
+                should_enforce_headings = _should_enforce_structured_output(user_input)
+                if should_enforce_headings and not _has_required_headings(cleaned):
+                    rewrite_prompt = _build_rewrite_prompt(cleaned)
+                    rewrite = agent.chat_with_xml_tools(rewrite_prompt, on_token=None, on_tool=on_tool)
+                    cleaned = _sanitize_final_output(rewrite)
+                    if not _has_required_headings(cleaned):
+                        missing = _missing_headings(cleaned)
+                        cleaned = (
+                            "[输出校验未通过]\n"
+                            f"缺失固定标题: {', '.join(missing)}\n\n"
+                            + cleaned
+                        )
+                panel_title = "Sanitized Response" if stream_output else "Response"
+                console.print(Panel(cleaned, title=panel_title, border_style="green"))
             else:
-                if stream_mode != "raw-only":
+                if not stream_output:
                     console.print(Panel(raw_response, title="Response (raw)", border_style="yellow"))
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted.[/yellow]")
         except Exception as e:
             console.print(f"\n[red]Error: {e}[/red]")
 
-
+#快捷帮助，帮助快速理解的
 def _show_help():
     console.print(Panel(
         "[bold cyan]$ Commands:[/bold cyan]\n"
@@ -389,7 +381,7 @@ def _show_help():
         "  /sessions      List saved sessions\n"
         "  /skills        Show loaded skills\n"
         "  /validate-output on|off  Toggle output sanitizer/validator\n"
-        "  /stream on|off|raw-only  Toggle streaming mode\n"
+        "  /stream on|off  Toggle token-by-token streaming display\n"
         "  quit           Exit CoreCoder\n"
         "\n"
         "[bold cyan]$ Input:[/bold cyan]\n"
@@ -404,10 +396,10 @@ def _brief(kwargs: dict, maxlen: int = 80) -> str:
     s = ", ".join(f"{k}={repr(v)[:40]}" for k, v in kwargs.items())
     return s[:maxlen] + ("..." if len(s) > maxlen else "")
 
-
+#移除协议标签和去重段落
 def _sanitize_final_output(text: str) -> str:
     """Sanitize model output by stripping protocol tags and deduplicating paragraphs."""
-    lines = text.splitlines()
+    lines = text.splitlines()#内置方法，不保留换行符，false表示不保留换行符，true表示保留换行符
     filtered: list[str] = []
     tag_pat = re.compile(r"</?(tool_call|function|parameter)(?:[=>].*)?>")
     for line in lines:
@@ -422,29 +414,29 @@ def _sanitize_final_output(text: str) -> str:
     seen: set[str] = set()
     unique_blocks: list[str] = []
     for block in blocks:
-        if not block:
+        if not block:#若是空白的
             continue
-        key = re.sub(r"\s+", " ", block).strip()
-        if key in seen:
+        key = re.sub(r"\s+", " ", block).strip()#正则表达式，\s匹配任何空白字符，+匹配一个或者多个
+        if key in seen:#如果出现了就添加，用于检测后续的重复
             continue
         seen.add(key)
         unique_blocks.append(block)
     return "\n\n".join(unique_blocks).strip()
 
-
+#标题规范化，去除多余的空白和符号，统一格式，便于后续的校验和处理
 def _normalize_heading(line: str) -> str:
     return line.strip().lstrip("#").lstrip("-").strip()
 
 
 def _missing_headings(text: str) -> list[str]:
-    present = {_normalize_heading(line) for line in text.splitlines() if line.strip()}
+    present = {_normalize_heading(line) for line in text.splitlines() if line.strip()}#函数式编程的思想
     return [h for h in _FIXED_HEADINGS if h not in present]
-
-
+ 
+ #判断文本是否包含所有必需的标题。
 def _has_required_headings(text: str) -> bool:
     return not _missing_headings(text)
 
-
+#生成一个格式指令，告诉 AI 如何修正它之前不规范的输出
 def _build_rewrite_prompt(previous: str) -> str:
     headings = "\n".join(f"- {h}" for h in _FIXED_HEADINGS)
     return (
@@ -458,7 +450,7 @@ def _build_rewrite_prompt(previous: str) -> str:
         f"{previous}"
     )
 
-
+#是否需要结构化输出
 def _should_enforce_structured_output(user_input: str) -> bool:
     """Enable 7-section enforcement only for task/report-like prompts."""
     text = user_input.strip().lower()

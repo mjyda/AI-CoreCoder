@@ -47,7 +47,7 @@ class AgentTool(Tool):
             max_context_tokens=parent.context.max_tokens,
             max_rounds=20,
         )
-
+        #创建子代理实例，传入父代理的语言模型和工具（但不包括agent工具本身，以避免递归），以及上下文限制和交互轮数限制。
         try:
             result = sub.chat(task)
             # trim long results to avoid blowing up parent's context

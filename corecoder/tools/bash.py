@@ -58,7 +58,7 @@ class BashTool(Tool):
             return f"⚠ Blocked: {warning}\nCommand: {command}\nIf intentional, modify the command to be more specific."
 
         # use tracked working directory
-        cwd = _cwd or os.getcwd()
+        cwd = _cwd or os.getcwd()#如果全局变量有值，就用它，否则用当前的工作目录
 
         try:
             proc = subprocess.run(
@@ -71,12 +71,12 @@ class BashTool(Tool):
             )
 
             # track cd commands so next command runs in the right place
-            if proc.returncode == 0:
+            if proc.returncode == 0:#执行成功了之后会变成这样
                 _update_cwd(command, cwd)
             out = proc.stdout
-            if proc.stderr:
+            if proc.stderr:#输出错误信息
                 out += f"\n[stderr]\n{proc.stderr}"
-            if proc.returncode != 0:
+            if proc.returncode != 0:#如果返回码不为0，说明执行过程中有错误发生
                 out += f"\n[exit code: {proc.returncode}]"
             # keep head + tail to preserve the most useful info
             if len(out) > 15_000:
@@ -94,7 +94,7 @@ class BashTool(Tool):
 
 def _check_dangerous(cmd: str) -> str | None:
     """Return a warning string if the command looks destructive, else None."""
-    for pattern, reason in _DANGEROUS_PATTERNS:
+    for pattern, reason in _DANGEROUS_PATTERNS:#在这个危险命令列表中进行检查
         if re.search(pattern, cmd):
             return reason
     return None
@@ -109,7 +109,7 @@ def _update_cwd(command: str, current_cwd: str):
         part = part.strip()
         if part.startswith("cd "):
             target = part[3:].strip().strip("'\"")
-            if target:
+            if target:#转换到当前的实际的目录
                 new_dir = os.path.normpath(os.path.join(current_cwd, os.path.expanduser(target)))
                 if os.path.isdir(new_dir):
-                    _cwd = new_dir
+                    _cwd = new_dir#更新全局的当前工作目录

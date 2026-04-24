@@ -32,9 +32,9 @@ class GlobTool(Tool):
                 return f"Error: {path} is not a directory"
 
             hits = list(base.glob(pattern))
-            # sort by mtime, newest first
+            # sort by mtime, newest first 按照修改的时间排序，最新的在前面
             hits.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
-
+        
             total = len(hits)
             shown = hits[:100]
             lines = [str(h) for h in shown]

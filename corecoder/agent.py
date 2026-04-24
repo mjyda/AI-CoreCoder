@@ -20,26 +20,27 @@ from .skills import Skill, skills_prompt_block
 
 
 class Agent:
-    def __init__(
-        self,
-        llm: LLM,
-        tools: list[Tool] | None = None,
-        skills: list[Skill] | None = None,
-        max_context_tokens: int = 128_000,
-        max_rounds: int = 50,
+    def __init__(        # 初始化方法，用于创建和配置智能代理实例
+        self,            # 实例引用
+        llm: LLM,        # 语言模型参数，用于处理自然语言
+        tools: list[Tool] | None = None,  # 工具列表，默认为None
+        skills: list[Skill] | None = None,  # 技能列表，默认为None
+        max_context_tokens: int = 128_000,  # 最大上下文标记数，默认为128,000
+        max_rounds: int = 50,               # 最大交互轮数，默认为50
     ):
-        self.llm = llm
-        self.tools = tools if tools is not None else ALL_TOOLS
-        self.skills = skills if skills is not None else []
-        self.messages: list[dict] = []
-        self.context = ContextManager(max_tokens=max_context_tokens)
-        self.max_rounds = max_rounds
-        self._system = system_prompt(self.tools, skills_prompt_block(self.skills))
+        self.llm = llm                      # 将传入的语言模型赋值给实例
+        self.tools =tools if tools is not None else ALL_TOOLS  # 如果未提供工具，则使用默认工具集
+         # 如果未提供工具，则使用默认工具集
+        self.skills = skills if skills is not None else []      # 如果未提供技能，则使用空列表
+        self.messages: list[dict] = []      # 初始化消息列表，用于存储对话历史
+        self.context = ContextManager(max_tokens=max_context_tokens)  # 初始化上下文管理器
+        self.max_rounds = max_rounds        # 设置最大交互轮数
+        self._system = system_prompt(self.tools, skills_prompt_block(self.skills))  # 生成系统提示
 
-        # wire up sub-agent capability
-        for t in self.tools:
-            if isinstance(t, AgentTool):
-                t._parent_agent = self
+        # wire up sub-agent capability  # 连接子代理能力
+        for t in self.tools:               # 遍历所有工具
+            if isinstance(t, AgentTool):    # 检查工具是否为AgentTool类型
+                t._parent_agent = self    # 如果是，则设置其父代理为当前实例
 
     def _full_messages(self) -> list[dict]:
         return [{"role": "system", "content": self._system}] + self.messages
@@ -98,7 +99,7 @@ class Agent:
         self.messages.append({"role": "user", "content": user_input})
         self.context.maybe_compress(self.messages, self.llm)
 
-        for _ in range(self.max_rounds):
+        for _ in range(self.max_rounds):#最多交互轮数,模型可能需要多次调用才能完成问题的解决
             resp = self.llm.chat(
                 messages=self._full_messages(),
                 on_token=on_token
@@ -118,7 +119,7 @@ class Agent:
                         "tool_call_id": tc.id,
                         "content": result,
                     })
-                else:
+                else:#多个工具的调用
                     results = self._exec_tools_parallel(resp.tool_calls, on_tool)
                     for tc, result in zip(resp.tool_calls, results):
                         self.messages.append({
@@ -146,6 +147,7 @@ class Agent:
         except Exception as e:
             return f"Error executing {tc.name}: {e}"
 
+#多线程执行，提高效率
     def _exec_tools_parallel(self, tool_calls, on_tool=None) -> list[str]:
         """Run multiple tool calls concurrently using threads.
 
@@ -156,7 +158,7 @@ class Agent:
         for tc in tool_calls:
             if on_tool:
                 on_tool(tc.name, tc.arguments)
-
+#自动资源管理，线程池会自动回收线程资源
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             futures = [pool.submit(self._exec_tool, tc) for tc in tool_calls]
             return [f.result() for f in futures]
