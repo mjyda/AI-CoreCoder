@@ -1,0 +1,43 @@
+{
+  "query_aliases": {
+    "知乎": "zhihu",
+    "github": "github",
+    "deepseek": "deepseek",
+    "学习通": "chaoxing",
+    "超星": "chaoxing",
+    "chaoxing": "chaoxing",
+    "b站": "bilibili",
+    "哔哩哔哩": "bilibili",
+    "微博": "weibo",
+    "微信": "wechat",
+    "代码仓库": "github",
+    "仓库": "github",
+    "开源项目": "github",
+    "论文": "arxiv",
+    "技术博客": "blog"
+  },
+  "canonical_query": {
+    "学习通": "chaoxing",
+    "超星学习通": "chaoxing",
+    "超星": "chaoxing",
+    "github": "github",
+    "知乎": "zhihu",
+    "微信": "wechat"
+  },
+  "strict_domains": {
+    "知乎": "zhihu.com",
+    "zhihu": "zhihu.com",
+    "github": "github.com",
+    "gitlab": "gitlab.com",
+    "deepseek": "deepseek.com",
+    "学习通": "chaoxing.com",
+    "超星": "chaoxing.com",
+    "chaoxing": "chaoxing.com",
+    "b站": "bilibili.com",
+    "哔哩哔哩": "bilibili.com",
+    "微博": "weibo.com",
+    "微信": "weixin.qq.com",
+    "x": "x.com",
+    "twitter": "x.com"
+  }
+}

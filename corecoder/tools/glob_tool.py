@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from .base import Tool
+from .sandbox import ensure_within_sandbox
 
 
 class GlobTool(Tool):
@@ -28,6 +29,9 @@ class GlobTool(Tool):
     def execute(self, pattern: str, path: str = ".") -> str:
         try:
             base = Path(path).expanduser().resolve()
+            denied = ensure_within_sandbox(base)
+            if denied:
+                return f"Error: {denied}"
             if not base.is_dir():
                 return f"Error: {path} is not a directory"
 
@@ -36,7 +40,7 @@ class GlobTool(Tool):
             hits.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
         
             total = len(hits)
-            shown = hits[:100]
+            shown = hits[:100]#只显示前100个匹配的文件
             lines = [str(h) for h in shown]
             result = "\n".join(lines)
 

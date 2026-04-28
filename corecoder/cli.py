@@ -20,8 +20,10 @@ from rich.live import Live
 from .agent import Agent
 from .llm import LLM
 from .config import Config
+from .multi_agent import SuperAssistant, HAS_LANGGRAPH
 from .session import save_session, load_session, list_sessions
 from .skills import load_skills
+from .tools.sandbox import SANDBOX_ROOT
 from . import __version__
 
 console = Console(force_terminal=True)
@@ -58,6 +60,53 @@ _TASK_INTENT_KEYWORDS = (
 )
 
 
+def _api_key_setup_examples() -> str:
+    """Return platform-aware API key setup examples for Windows/Linux."""
+    is_windows = sys.platform == "win32"
+    shell_name = "PowerShell (Windows)" if is_windows else "Bash/Zsh (Linux/macOS)"
+
+    if is_windows:
+        openai_cmd = '$env:OPENAI_API_KEY="sk-..."'
+        deepseek_cmd = (
+            '$env:OPENAI_API_KEY="sk-..."; '
+            '$env:OPENAI_BASE_URL="https://api.deepseek.com"'
+        )
+        ollama_cmd = (
+            '$env:OPENAI_API_KEY="ollama"; '
+            '$env:OPENAI_BASE_URL="http://localhost:11434/v1"; '
+            '$env:CORECODER_MODEL="qwen2.5-coder"'
+        )
+    else:
+        openai_cmd = "export OPENAI_API_KEY=sk-..."
+        deepseek_cmd = "export OPENAI_API_KEY=sk-... OPENAI_BASE_URL=https://api.deepseek.com"
+        ollama_cmd = (
+            "export OPENAI_API_KEY=ollama OPENAI_BASE_URL=http://localhost:11434/v1 "
+            "CORECODER_MODEL=qwen2.5-coder"
+        )
+
+    windows_note = (
+        "\nTip: For persistent vars on Windows, use:\n"
+        '  setx OPENAI_API_KEY "sk-..."\n'
+        "Then open a new terminal."
+    )
+    linux_note = "\nTip: Add exports to ~/.bashrc or ~/.zshrc for persistence."
+
+    return (
+        "Set one of: OPENAI_API_KEY, DEEPSEEK_API_KEY, or CORECODER_API_KEY\n"
+        f"\nDetected shell style: {shell_name}\n"
+        "\nExamples:\n"
+        "  # OpenAI\n"
+        f"  {openai_cmd}\n"
+        "\n"
+        "  # DeepSeek\n"
+        f"  {deepseek_cmd}\n"
+        "\n"
+        "  # Ollama (local)\n"
+        f"  {ollama_cmd}\n"
+        + (windows_note if is_windows else linux_note)
+    )
+
+
 def _parse_args():
     p = argparse.ArgumentParser(
         prog="corecoder",
@@ -67,6 +116,12 @@ def _parse_args():
     p.add_argument("--base-url", help="API base URL (default: $OPENAI_BASE_URL)")
     p.add_argument("--api-key", help="API key (default: $OPENAI_API_KEY)")
     p.add_argument("-p", "--prompt", help="One-shot prompt (non-interactive mode)")
+    p.add_argument("--super-assistant", action="store_true", help="Enable supervisor + experts mode")
+    p.add_argument(
+        "--session-persist",
+        action="store_true",
+        help="Persist SuperAssistant session under sandbox (env CORECODER_SESSION_PERSIST)",
+    )
     p.add_argument("-r", "--resume", metavar="ID", help="Resume a saved session")
     p.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     return p.parse_args()
@@ -83,22 +138,15 @@ def main():
         config.base_url = args.base_url
     if args.api_key:
         config.api_key = args.api_key
+    if args.super_assistant:
+        config.super_assistant = True
+    if args.session_persist:
+        config.session_persist = True
 
      #如果没有找到API密钥，提示用户设置环境变量并退出
     if not config.api_key:
         console.print("[red bold]No API key found.[/]")
-        console.print(
-            "Set one of: OPENAI_API_KEY, DEEPSEEK_API_KEY, or CORECODER_API_KEY\n"
-            "\nExamples:\n"
-            "  # OpenAI\n"
-            "  export OPENAI_API_KEY=sk-...\n"
-            "\n"
-            "  # DeepSeek\n"
-            "  export OPENAI_API_KEY=sk-... OPENAI_BASE_URL=https://api.deepseek.com\n"
-            "\n"
-            "  # Ollama (local)\n"
-            "  export OPENAI_API_KEY=ollama OPENAI_BASE_URL=http://localhost:11434/v1 CORECODER_MODEL=qwen2.5-coder\n"
-        )
+        console.print(_api_key_setup_examples())
         sys.exit(1)
      #程序异常退出时，显示错误信息 
     llm = LLM(
@@ -110,6 +158,12 @@ def main():
     )
     skills = load_skills()
     agent = Agent(llm=llm, skills=skills, max_context_tokens=config.max_context_tokens)
+    _ssp = (config.session_snapshot_path or "").strip()
+    super_assistant = SuperAssistant(
+        llm=llm,
+        persist_session=config.session_persist,
+        session_snapshot_path=_ssp if _ssp else None,
+    )
 
     # resume saved session
     if args.resume:
@@ -127,14 +181,14 @@ def main():
 #这个过程进行加载数据的，如果找到和找不到的时候异常退出，并且显示错误信息
     # one-shot mode，单词执行
     if args.prompt:
-        _run_once(agent, args.prompt)
+        _run_once(agent, args.prompt, super_assistant if config.super_assistant else None)
         return
 
     # interactive REPL，交互式命令行界面
-    _repl(agent, config)
+    _repl(agent, config, super_assistant)
 
 
-def _run_once(agent: Agent, prompt: str):
+def _run_once(agent: Agent, prompt: str, super_assistant: SuperAssistant | None = None):
     """Non-interactive: run one prompt and exit."""
     def on_token(tok):
         # Use plain print with UTF-8 encoding to avoid Windows issues
@@ -148,20 +202,35 @@ def _run_once(agent: Agent, prompt: str):
     def on_tool(name, kwargs):
         print(f"\n$ {name}({_brief(kwargs)})")
 #这个函数表示在干什么，调用什么工具，并且把结果打印出来
-    # Use XML-based tool calling for local models
-    agent.chat_with_xml_tools(prompt, on_token=on_token, on_tool=on_tool)
-    print()
+    if super_assistant:
+        print(super_assistant.run(prompt))
+    else:
+        # Use XML-based tool calling for local models
+        agent.chat_with_xml_tools(prompt, on_token=on_token, on_tool=on_tool)
+        print()
 
 #交互式面板,就是运行之后的那个上面的显示，包括模型名称，版本号，提示信息等
-def _repl(agent: Agent, config: Config):
+def _repl(agent: Agent, config: Config, super_assistant: SuperAssistant):
     """Interactive read-eval-print loop."""
     console.print(Panel(
         f"[bold cyan]$ CoreCoder[/bold cyan] v{__version__}\n"
         f"[bold cyan]$ Model:[/bold cyan] [cyan]{config.model}[/cyan]"
         + (f"  [bold cyan]$ Base:[/bold cyan] [cyan]{config.base_url}[/cyan]" if config.base_url else "")
-        + "\n[bold cyan]$ Type /help for commands, Ctrl+C to cancel, quit to exit.[/bold cyan]",
+        + f"\n[bold cyan]$ SuperAssistant:[/bold cyan] [cyan]{'on' if config.super_assistant else 'off'}[/cyan]"
+        + f"  [bold cyan]$ LangGraph:[/bold cyan] [cyan]{'enabled' if HAS_LANGGRAPH else 'fallback'}[/cyan]"
+        + "\n[bold cyan]$ Type /help for commands, Ctrl+C to cancel, quit to exit.[/bold cyan]"
+        + "\n[bold cyan]$ SuperAssistant session:[/bold cyan] [cyan]/context[/cyan] 查看，"
+        + "[cyan]/context clear[/cyan] 清空，[cyan]/context persist on|off|reload[/cyan] 持久化",
         border_style="cyan",
     ))
+    if config.super_assistant:
+        console.print(
+            Panel(
+                super_assistant.orchestration_debug_preview(),
+                title="SuperAssistant Orchestration Debug",
+                border_style="cyan",
+            )
+        )
     #保存命令历史
     hist_path = os.path.expanduser("~/.corecoder_history")
     history = FileHistory(hist_path)
@@ -234,7 +303,9 @@ def _repl(agent: Agent, config: Config):
             continue
         if user_input == "/reset":
             agent.reset()
-            console.print("[yellow]Conversation reset.[/yellow]")
+            if config.super_assistant:
+                super_assistant.clear_session_context()
+            console.print("[yellow]Conversation reset（含 SuperAssistant 会话上下文）.[/yellow]")
             continue
         if user_input == "/tokens":
             p = agent.llm.total_prompt_tokens#模型输入消耗，输出消耗
@@ -319,6 +390,170 @@ def _repl(agent: Agent, config: Config):
             else:
                 console.print("[yellow]Usage: /stream on|off[/yellow]")
             continue
+        if user_input == "/context" or user_input.startswith("/context "):
+            if not config.super_assistant:
+                console.print("[yellow]Super assistant mode is off. Use /assistant on first.[/yellow]")
+                continue
+            arg = user_input[len("/context"):].strip()
+            arg_lower = arg.lower()
+            if arg_lower.startswith("persist "):
+                sub = arg_lower[len("persist ") :].strip()
+                if sub == "on":
+                    config.session_persist = True
+                    st = super_assistant.set_session_persist(True, reload_from_disk=False)
+                    if st.get("write_error"):
+                        console.print(f"[red]持久化已开启，但写入快照失败：{st['write_error']}[/red]")
+                    else:
+                        console.print(
+                            "[green]SuperAssistant 会话持久化已开启。[/green]\n"
+                            f"[dim]快照路径：{st['snapshot_path']}（每轮专家执行结束后写入；"
+                            "此前 persist=off 时不会产生该文件）[/dim]"
+                        )
+                elif sub == "off":
+                    config.session_persist = False
+                    super_assistant.set_session_persist(False)
+                    console.print("[yellow]SuperAssistant 会话持久化已关闭（已有 .session.json 仍保留）。[/yellow]")
+                elif sub == "reload":
+                    config.session_persist = True
+                    st = super_assistant.set_session_persist(True, reload_from_disk=True)
+                    if st.get("write_error"):
+                        console.print(f"[red]写入快照失败：{st['write_error']}[/red]")
+                    elif st.get("loaded_from_disk"):
+                        console.print(
+                            f"[green]已从磁盘加载会话快照（{st.get('turns_loaded', 0)} 条轮次摘要）。[/green]\n"
+                            f"[dim]{st['snapshot_path']}[/dim]"
+                        )
+                    else:
+                        console.print(
+                            "[yellow]未找到有效快照（例如从未开启 persist 或快照已删）。[/yellow]\n"
+                            f"[dim]{st.get('note', '')}[/dim]\n"
+                            f"[dim]已开启持久化，并将当前内存会话写入：{st['snapshot_path']}[/dim]"
+                        )
+                else:
+                    console.print("[yellow]Usage: /context persist on|off|reload[/yellow]")
+                continue
+            if arg_lower == "clear":
+                super_assistant.clear_session_context()
+                console.print("[green]Supervisor 会话上下文已清空（若开启持久化则已删除快照文件）。[/green]")
+                continue
+            console.print(
+                Panel(
+                    super_assistant.session_context_preview(),
+                    title="SuperAssistant Session Context",
+                    border_style="cyan",
+                )
+            )
+            continue
+        if user_input == "/assistant" or user_input.startswith("/assistant "):
+            arg = user_input[len("/assistant"):].strip().lower()
+            if not arg:
+                state = "on" if config.super_assistant else "off"
+                console.print(f"Super assistant mode is [cyan]{state}[/cyan]")
+                continue
+            if arg in ("on", "off"):
+                config.super_assistant = (arg == "on")
+                console.print(f"Super assistant mode switched [cyan]{arg}[/cyan]")
+            else:
+                console.print("[yellow]Usage: /assistant on|off[/yellow]")
+            continue
+        if user_input == "/reload-mappings":
+            if not config.super_assistant:
+                console.print("[yellow]Super assistant mode is off. Use /assistant on first.[/yellow]")
+                continue
+            stats = super_assistant.reload_mappings()
+            console.print(
+                "[green]Browser site mappings reloaded:[/green] "
+                f"query_aliases={stats['query_aliases']}, "
+                f"canonical_query={stats['canonical_query']}, "
+                f"strict_domains={stats['strict_domains']}"
+            )
+            continue
+        if user_input == "/show-mappings":
+            if not config.super_assistant:
+                console.print("[yellow]Super assistant mode is off. Use /assistant on first.[/yellow]")
+                continue
+            mappings = super_assistant.show_mappings()
+            parts: list[str] = []
+            for section in ("query_aliases", "canonical_query", "strict_domains"):
+                section_map = mappings.get(section, {})
+                parts.append(f"[bold cyan]{section} ({len(section_map)}):[/bold cyan]")
+                for k in sorted(section_map):
+                    parts.append(f"  {k} -> {section_map[k]}")
+            console.print(Panel("\n".join(parts), title="Browser Site Mappings", border_style="cyan"))
+            continue
+        if user_input == "/show-file-tools":
+            if not config.super_assistant:
+                console.print("[yellow]Super assistant mode is off. Use /assistant on first.[/yellow]")
+                continue
+            tools = super_assistant.show_file_tools()
+            if not tools:
+                console.print("[yellow]No tools are currently available for file expert.[/yellow]")
+            else:
+                lines = ["[bold cyan]File expert available tools:[/bold cyan]"]
+                lines.extend(f"  - {name}" for name in tools)
+                console.print(Panel("\n".join(lines), title="File Expert Tools", border_style="cyan"))
+            continue
+        if user_input == "/sandbox":
+            console.print(
+                Panel(
+                    f"[bold cyan]Current sandbox root:[/bold cyan]\n{SANDBOX_ROOT}",
+                    title="CoreCoder Sandbox",
+                    border_style="cyan",
+                )
+            )
+            continue
+        if user_input == "/debug":
+            if not config.super_assistant:
+                console.print("[yellow]Super assistant mode is off. Use /assistant on first.[/yellow]")
+                continue
+            console.print(
+                Panel(
+                    super_assistant.orchestration_debug_preview(),
+                    title="SuperAssistant Orchestration Debug",
+                    border_style="cyan",
+                )
+            )
+            continue
+        if user_input == "/files-help":
+            sandbox_root = str(SANDBOX_ROOT)
+            console.print(Panel(
+                f"[bold cyan]$ File Tools (sandbox: {sandbox_root}):[/bold cyan]\n"
+                "\n"
+                "[bold cyan]$ 1) list_directory[/bold cyan]\n"
+                f"  Params: path='{sandbox_root}', recursive=false, limit=200\n"
+                f"  Example: 列出 {sandbox_root} 下前 50 个文件\n"
+                "\n"
+                "[bold cyan]$ 2) read_file[/bold cyan]\n"
+                "  Params: file_path, offset=1, limit=2000\n"
+                f"  Example: 读取 {sandbox_root}\\notes.md 前 100 行\n"
+                "\n"
+                "[bold cyan]$ 3) write_file[/bold cyan]\n"
+                "  Params: file_path, content\n"
+                f"  Example: 将内容写入 {sandbox_root}\\todo.txt\n"
+                "\n"
+                "[bold cyan]$ 4) append_file[/bold cyan]\n"
+                "  Params: file_path, content\n"
+                f"  Example: 在 {sandbox_root}\\todo.txt 末尾追加一行\n"
+                "\n"
+                "[bold cyan]$ 5) edit_file[/bold cyan]\n"
+                "  Params: file_path, old_string, new_string\n"
+                "  Example: 把 config.json 里的 old_value 替换成 new_value\n"
+                "\n"
+                "[bold cyan]$ 6) search_files[/bold cyan]\n"
+                f"  Params: query, path='{sandbox_root}', limit=100\n"
+                f"  Example: 在 {sandbox_root} 搜索文件名包含 report 的文件\n"
+                "\n"
+                "[bold cyan]$ 7) grep_in_files[/bold cyan]\n"
+                f"  Params: query, path='{sandbox_root}', include(optional)\n"
+                f"  Example: 在 {sandbox_root} 的 *.md 中搜索 TODO\n"
+                "\n"
+                "[bold cyan]$ 8) file_info[/bold cyan]\n"
+                "  Params: path\n"
+                f"  Example: 查看 {sandbox_root}\\notes.md 的大小和修改时间\n",
+                title="CoreCoder File Tools Help",
+                border_style="cyan",
+            ))
+            continue
 
         # call the agent
         streamed_tokens: list[str] = []
@@ -336,15 +571,21 @@ def _repl(agent: Agent, config: Config):
             console.print(f"\n[dim]$ {name}({_brief(kwargs)})[/dim]")
 
         try:
-            # Use XML-based tool calling for local models
-            response = agent.chat_with_xml_tools(user_input, on_token=on_token, on_tool=on_tool)
-            raw_response = "".join(streamed_tokens).strip() if streamed_tokens else response
+            if config.super_assistant:
+                response = super_assistant.run(user_input)
+                raw_response = response
+            else:
+                # Use XML-based tool calling for local models
+                response = agent.chat_with_xml_tools(user_input, on_token=on_token, on_tool=on_tool)
+                raw_response = "".join(streamed_tokens).strip() if streamed_tokens else response
             if stream_output and raw_response:#一个空行，更美观
                 console.print()
 
             if validate_output:
                 cleaned = _sanitize_final_output(raw_response)
-                should_enforce_headings = _should_enforce_structured_output(user_input)
+                should_enforce_headings = _should_enforce_structured_output(
+                    user_input, super_assistant_mode=config.super_assistant
+                )
                 if should_enforce_headings and not _has_required_headings(cleaned):
                     rewrite_prompt = _build_rewrite_prompt(cleaned)
                     rewrite = agent.chat_with_xml_tools(rewrite_prompt, on_token=None, on_tool=on_tool)
@@ -364,7 +605,7 @@ def _repl(agent: Agent, config: Config):
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted.[/yellow]")
         except Exception as e:
-            console.print(f"\n[red]Error: {e}[/red]")
+            console.print(f"\n[red]Error: {_friendly_error_message(e)}[/red]")
 
 #快捷帮助，帮助快速理解的
 def _show_help():
@@ -382,6 +623,19 @@ def _show_help():
         "  /skills        Show loaded skills\n"
         "  /validate-output on|off  Toggle output sanitizer/validator\n"
         "  /stream on|off  Toggle token-by-token streaming display\n"
+        "  /assistant on|off  Toggle supervisor + experts mode\n"
+        "  /context       Show SuperAssistant session context (last file, route, turns)\n"
+        "  /context clear Clear session (and delete snapshot if persist is on)\n"
+        "  /context persist on|off|reload  Toggle disk persistence or reload from .session.json\n"
+        "  --session-persist  CLI flag: enable persist for this process\n"
+        "  Env: CORECODER_SANDBOX_ROOT, CORECODER_SESSION_PERSIST, CORECODER_SESSION_PATH (under sandbox only)\n"
+        "  Note: .session.json is written only while persist is on; off = in-memory only until exit.\n"
+        "  /reload-mappings  Reload browser site mapping config\n"
+        "  /show-mappings  Show active browser site mappings\n"
+        "  /show-file-tools  Show current tools available to file expert\n"
+        "  /sandbox       Show current effective sandbox root\n"
+        "  /debug         Show registered planners/actions and risk policy\n"
+        "  /files-help  Show file tools params and examples\n"
         "  quit           Exit CoreCoder\n"
         "\n"
         "[bold cyan]$ Input:[/bold cyan]\n"
@@ -395,6 +649,29 @@ def _show_help():
 def _brief(kwargs: dict, maxlen: int = 80) -> str:
     s = ", ".join(f"{k}={repr(v)[:40]}" for k, v in kwargs.items())
     return s[:maxlen] + ("..." if len(s) > maxlen else "")
+
+
+def _friendly_error_message(exc: Exception) -> str:
+    """Convert low-level exceptions to actionable Chinese hints."""
+    raw = str(exc) or exc.__class__.__name__
+    lower = raw.lower()
+
+    is_encoding_issue = isinstance(exc, UnicodeDecodeError) or (
+        "codec can't decode" in lower
+        or ("unicode" in lower and "decode" in lower)
+        or "_readerthread" in lower
+        or "gbk" in lower
+    )
+    if is_encoding_issue:
+        return (
+            "检测到编码解码错误（常见于 Windows 的 GBK/UTF-8 混用）。\n"
+            "建议操作：\n"
+            "1) 在 PowerShell 执行 `chcp 65001` 后重试；\n"
+            "2) 尽量使用 UTF-8 输出的命令或工具；\n"
+            "3) 若仍失败，重启终端后再运行 CoreCoder。"
+        )
+
+    return raw
 
 #移除协议标签和去重段落
 def _sanitize_final_output(text: str) -> str:
@@ -451,8 +728,12 @@ def _build_rewrite_prompt(previous: str) -> str:
     )
 
 #是否需要结构化输出
-def _should_enforce_structured_output(user_input: str) -> bool:
+def _should_enforce_structured_output(user_input: str, super_assistant_mode: bool = False) -> bool:
     """Enable 7-section enforcement only for task/report-like prompts."""
+    if super_assistant_mode:
+        # SuperAssistant returns role/evidence structured outputs and may include
+        # operation confirmations that should not be forced into 7 fixed sections.
+        return False
     text = user_input.strip().lower()
     if not text:
         return False

@@ -3,6 +3,7 @@
 import re
 from pathlib import Path
 from .base import Tool
+from .sandbox import ensure_within_sandbox
 
 # skip these dirs to avoid noise  垃圾目录列表，避免搜索时出现太多无用的结果
 _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox", "dist", "build"}
@@ -40,6 +41,9 @@ class GrepTool(Tool):
             return f"Invalid regex: {e}"
         #默认当前路径
         base = Path(path).expanduser().resolve()#解析为绝对路径，消除 .. 和符号链接
+        denied = ensure_within_sandbox(base)
+        if denied:
+            return f"Error: {denied}"
         if not base.exists():
             return f"Error: {path} not found"
 

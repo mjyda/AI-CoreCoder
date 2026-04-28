@@ -5,6 +5,15 @@ __version__ = "0.2.0"
 from corecoder.agent import Agent
 from corecoder.llm import LLM
 from corecoder.config import Config
+from corecoder.multi_agent import AssistantSessionContext, SuperAssistant
 from corecoder.tools import ALL_TOOLS
 
-__all__ = ["Agent", "LLM", "Config", "ALL_TOOLS", "__version__"]
+__all__ = [
+    "Agent",
+    "LLM",
+    "Config",
+    "SuperAssistant",
+    "AssistantSessionContext",
+    "ALL_TOOLS",
+    "__version__",
+]

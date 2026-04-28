@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from .base import Tool
+from .sandbox import ensure_within_sandbox
 
 
 class ReadFileTool(Tool):
@@ -32,6 +33,9 @@ class ReadFileTool(Tool):
     def execute(self, file_path: str, offset: int = 1, limit: int = 2000) -> str:
         try:#从第几行开始读取，默认从第一行开始；最多读取多少行，默认2000行
             p = Path(file_path).expanduser().resolve()
+            denied = ensure_within_sandbox(p)
+            if denied:
+                return f"Error: {denied}"
             if not p.exists():
                 return f"Error: {file_path} not found"
             if not p.is_file():

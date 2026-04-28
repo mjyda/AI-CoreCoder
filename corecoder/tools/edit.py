@@ -10,6 +10,7 @@ import difflib
 from pathlib import Path
 
 from .base import Tool
+from .sandbox import ensure_within_sandbox
 
 # track files changed this session for /diff
 _changed_files: set[str] = set()
@@ -44,10 +45,13 @@ class EditFileTool(Tool):
     def execute(self, file_path: str, old_string: str, new_string: str) -> str:
         try:
             p = Path(file_path).expanduser().resolve()
+            denied = ensure_within_sandbox(p)
+            if denied:
+                return f"Error: {denied}"
             if not p.exists():
                 return f"Error: {file_path} not found"
 
-            content = p.read_text()
+            content = p.read_text(encoding="utf-8", errors="replace")
             occurrences = content.count(old_string)
 
             if occurrences == 0:
@@ -63,7 +67,7 @@ class EditFileTool(Tool):
                 )
 
             new_content = content.replace(old_string, new_string, 1)
-            p.write_text(new_content)
+            p.write_text(new_content, encoding="utf-8", errors="replace")
             _changed_files.add(str(p))
 
             # generate a unified diff so the user/LLM can see exactly what changed
