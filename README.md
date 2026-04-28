@@ -1,174 +1,178 @@
 # CoreCoder
 
-> Formerly **NanoCoder** — renamed to avoid confusion with [Nano-Collective/nanocoder](https://github.com/Nano-Collective/nanocoder). All links from the old repo redirect here automatically.
-
-
 [![PyPI](https://img.shields.io/pypi/v/corecoder)](https://pypi.org/project/corecoder/)
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Tests](https://github.com/he-yufeng/CoreCoder/actions/workflows/ci.yml/badge.svg)](https://github.com/he-yufeng/CoreCoder/actions)
 
-[中文](README_CN.md) | [English](README.md) | [Claude Code Architecture Deep Dive (7 articles)](article/)
+[中文](README_CN.md) | [English](README.md) | [Architecture Notes](article/)
 
-**512,000 lines of TypeScript → ~950 lines of Python.**
+CoreCoder is a **natural-language personal assistant framework** built around a coding agent core, a supervisor-style multi-agent layer, and a pluggable action/execution system.
 
-I spent two days reverse-engineering the leaked Claude Code source — all half a million lines. Then I stripped it down to the load-bearing walls and rebuilt them in Python. The result: **every key architectural pattern from Claude Code, in a codebase you can read in one sitting.**
+This repository is no longer just a minimal coding-agent demo. It has evolved into a project for building an assistant that can:
 
-CoreCoder is not another AI coding tool. It's a **blueprint** — the [nanoGPT](https://github.com/karpathy/nanoGPT) of coding agents. Read it, fork it, build your own.
+- understand natural language requests,
+- route work across multiple experts,
+- compose multi-step execution plans dynamically,
+- call local tools safely inside a configurable sandbox,
+- persist short-term and semantic context,
+- and execute cross-domain tasks such as browser -> transform -> file/mail.
 
----
+## What This Project Is
 
+CoreCoder currently combines two layers:
+
+1. **Base coding agent runtime**
+   - LLM wrapper
+   - tool calling
+   - context compression
+   - session save/resume
+   - CLI / REPL
+
+2. **SuperAssistant orchestration layer**
+   - supervisor + experts
+   - semantic slot parsing
+   - dynamic planning via capability graph
+   - pluggable step executors
+   - confirmation / clarification / risk control
+   - persistent session and semantic memory
+
+## Current Experts
+
+The repository currently includes 4 expert roles:
+
+- `browser`: browser history and site-oriented tasks
+- `mail`: list/search/read/send/reply/delete-style mail workflows
+- `file`: file reading, writing, rewriting, formatting, exporting
+- `coding`: general coding and codebase operations
+
+In practice, the most actively orchestrated cross-expert workflows today are:
+
+- `browser -> file`
+- `browser -> mail`
+- `file -> mail`
+- `mail -> file`
+- multi-target output such as `mail + local file`
+
+## Current Capabilities
+
+Highlights already implemented in the current codebase:
+
+- semantic slot parsing for `intent / source / transform / target / constraints`
+- dynamic execution plan staging with `confirm / modify / cancel`
+- BFS-based capability graph path search
+- multi-hop planning such as `source -> transform -> target`
+- multi-target execution
+- multi-format export (`json`, `text`, `markdown`)
+- multi-recipient and multi-email delivery modes
+- session persistence and semantic memory hints
+- debug views for planners, actions, and path search
+- configurable sandbox root via `.env`
+
+## Project Structure
+
+The most important directories are:
+
+```text
+corecoder/
+├── cli.py                    REPL and user-facing commands
+├── runtime/                  base agent runtime pieces
+├── platform/                 config and MCP-related integration
+├── multi_agent/              supervisor, planners, mixins, session context
+├── tools/                    file/shell/search/mail/browser-facing tools
+├── article/                  architecture notes and long-form docs
+├── scripts/                  helper and verification scripts
+└── tests/                    test assets and future test coverage
 ```
-$ corecoder -m kimi-k2.5
 
-You > read main.py and fix the broken import
+Within the orchestration layer:
 
-  > read_file(file_path='main.py')
-  > edit_file(file_path='main.py', ...)
-
---- a/main.py
-+++ b/main.py
-@@ -1 +1 @@
--from utils import halper
-+from utils import helper
-
-Fixed: halper → helper.
+```text
+corecoder/multi_agent/
+├── __init__.py               SuperAssistant entry and orchestration shell
+├── plan_engine.py            semantic planning, BFS path search, step execution
+├── session_context.py        session memory and semantic memory persistence
+├── multi_agent_browser.py    browser expert logic
+├── multi_agent_mail.py       mail expert logic
+└── multi_agent_file.py       file expert logic
 ```
 
-## What You Get
+## Quick Start
 
-Claude Code's 512K lines distilled into ~1,400 lines across 7 patterns that actually matter:
-
-| Pattern | Claude Code | CoreCoder |
-|---|---|---|
-| Search-and-replace editing (unique match + diff) | FileEditTool | `tools/edit.py` — 70 lines |
-| Parallel tool execution | StreamingToolExecutor (530 lines) | `agent.py` — ThreadPool |
-| 3-layer context compression | HISTORY_SNIP → Microcompact → CONTEXT_COLLAPSE | `context.py` — 145 lines |
-| Sub-agent with isolated context | AgentTool (1,397 lines) | `tools/agent.py` — 50 lines |
-| Dangerous command blocking | BashTool (1,143 lines) | `tools/bash.py` — 95 lines |
-| Session persistence | QueryEngine (1,295 lines) | `session.py` — 65 lines |
-| Dynamic system prompt | prompts.ts (914 lines) | `prompt.py` — 35 lines |
-
-Every pattern is a real, runnable implementation — not a diagram or a blog post.
-
-## Install
+Install:
 
 ```bash
 pip install corecoder
 ```
 
-Pick your model — any OpenAI-compatible API works. You can `export` env vars or drop a `.env` file in your project root:
+Or run locally in this repo with your `.env`.
+
+Minimal configuration example:
+
+```env
+OPENAI_API_KEY=local
+OPENAI_BASE_URL=http://localhost:8000/v1
+CORECODER_MODEL=qwen3-coder-30b
+CORECODER_SANDBOX_ROOT=D:\corecodertest
+```
+
+Run:
 
 ```bash
-# Kimi K2.5
-export OPENAI_API_KEY=your-key OPENAI_BASE_URL=https://api.moonshot.ai/v1
-corecoder -m kimi-k2.5
-
-# Claude Opus 4.6 (via OpenRouter)
-export OPENAI_API_KEY=your-key OPENAI_BASE_URL=https://openrouter.ai/api/v1
-corecoder -m anthropic/claude-opus-4-6
-
-# OpenAI GPT-5
-export OPENAI_API_KEY=sk-...
-corecoder -m gpt-5
-
-# DeepSeek V3
-export OPENAI_API_KEY=sk-... OPENAI_BASE_URL=https://api.deepseek.com
-corecoder -m deepseek-chat
-
-# Qwen 3.5
-export OPENAI_API_KEY=sk-... OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-corecoder -m qwen-max
-
-# Ollama (local)
-export OPENAI_API_KEY=ollama OPENAI_BASE_URL=http://localhost:11434/v1
-corecoder -m qwen3:32b
-
-# One-shot mode
-corecoder -p "add error handling to parse_config()"
+corecoder --super-assistant
 ```
 
-## Architecture
+## Example Prompts
 
-The whole thing fits in your head:
+```text
+把最近5条浏览记录保存在本地，文件名字为test1
 
-```
-corecoder/
-├── cli.py            REPL + commands               218 lines
-├── agent.py          Agent loop + parallel tools    122 lines
-├── llm.py            Streaming client + retry       156 lines
-├── context.py        3-layer compression            196 lines
-├── session.py        Save/resume                     68 lines
-├── prompt.py         System prompt                   33 lines
-├── config.py         Env config                      55 lines
-└── tools/
-    ├── bash.py       Shell + safety + cd tracking   115 lines
-    ├── edit.py       Search-replace + diff            85 lines
-    ├── read.py       File reading                     53 lines
-    ├── write.py      File writing                     36 lines
-    ├── glob_tool.py  File search                      47 lines
-    ├── grep.py       Content search                   78 lines
-    └── agent.py      Sub-agent spawning               58 lines
+将文件test1发送给xxx@qq.com
+
+把最近5条浏览记录以json和文本格式分别发送给a@qq.com和b@qq.com
+
+把最近5封邮件逐封概括后导出到文件
 ```
 
-## Use as a Library
+## Useful Commands
 
-```python
-from corecoder import Agent, LLM
-
-llm = LLM(model="kimi-k2.5", api_key="your-key", base_url="https://api.moonshot.ai/v1")
-agent = Agent(llm=llm)
-response = agent.chat("find all TODO comments in this project and list them")
+```text
+/help
+/debug
+/sandbox
+/context
+/show-file-tools
+/show-mappings
+/reload-mappings
 ```
 
-## Add Your Own Tools (~20 lines)
+## Configuration
 
-```python
-from corecoder.tools.base import Tool
+Core configuration is driven by `.env`.
 
-class HttpTool(Tool):
-    name = "http"
-    description = "Fetch a URL."
-    parameters = {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}
+Important variables:
 
-    def execute(self, url: str) -> str:
-        import urllib.request
-        return urllib.request.urlopen(url).read().decode()[:5000]
-```
+- `CORECODER_MODEL`
+- `OPENAI_API_KEY`
+- `OPENAI_BASE_URL`
+- `CORECODER_SANDBOX_ROOT`
+- `CORECODER_SESSION_PERSIST`
+- `CORECODER_SESSION_PATH`
+- `CORECODER_EMAIL_ADDRESS`
+- `CORECODER_EMAIL_APP_PASSWORD`
+- `CORECODER_IMAP_HOST`
+- `CORECODER_SMTP_HOST`
 
-## Commands
+## Roadmap Direction
 
-```
-/model           Show current model
-/model <name>    Switch model mid-conversation
-/compact         Compress context (like Claude Code's /compact)
-/tokens          Token usage + cost estimate
-/diff            Show files modified this session
-/save            Save session to disk
-/sessions        List saved sessions
-/reset           Clear history
-quit             Exit
-```
+The repository is trending toward a more general personal super-assistant architecture:
 
-## How It Compares
-
-|  | Claude Code | Claw-Code | Aider | CoreCoder |
-|---|---|---|---|---|
-| Code | 512K lines (closed) | 100K+ lines | 50K+ lines | **~950 lines** |
-| Models | Anthropic only | Multi | Multi | **Any OpenAI-compatible** |
-| Readable? | No | Hard | Medium | **One afternoon** |
-| Purpose | Use it | Use it | Use it | **Understand it, build yours** |
-
-## The Deep Dive
-
-I wrote [7 articles](article/) breaking down Claude Code's architecture — the agent loop, tool system, context compression, streaming executor, multi-agent, and 44 hidden feature flags. If you want to understand *why* CoreCoder is designed this way, start there.
+- richer semantic parsing
+- more pluggable actions and tools
+- temporary/generated capabilities created by the coding expert
+- clearer expert boundaries
+- stronger evaluation and regression coverage
 
 ## License
 
-MIT. Fork it, learn from it, ship something better. A mention of this project is appreciated.
-
----
-
-Built by **[Yufeng He](https://github.com/he-yufeng)** · Agentic AI Researcher @ Moonshot AI (Kimi)
-
-[Claude Code Source Analysis — 170K+ reads, 6000 bookmarks on Zhihu](https://zhuanlan.zhihu.com/p/1898797658343862272)
+MIT.
