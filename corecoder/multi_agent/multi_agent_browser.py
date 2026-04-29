@@ -21,6 +21,18 @@ class BrowserTaskMixin:
         }
         for bad, good in replacements.items():
             repaired = repaired.replace(bad, good)
+        # Common mojibake fix: UTF-8 bytes decoded as latin-1/cp1252.
+        def _fix_chunk(chunk: str) -> str:
+            try:
+                fixed = chunk.encode("latin-1").decode("utf-8")
+            except Exception:
+                return chunk
+            # Only accept if decode clearly improves readability (contains CJK).
+            if re.search(r"[\u4e00-\u9fff]", fixed):
+                return fixed
+            return chunk
+
+        repaired = re.sub(r"[\x80-\xff]{3,}", lambda m: _fix_chunk(m.group(0)), repaired)
         return repaired
 
     def _run_browser_task(self, user_input: str) -> str:

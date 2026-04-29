@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import re
+import textwrap
 from datetime import datetime, timezone
 from typing import Any, Callable, TypedDict
 from pathlib import Path
@@ -13,193 +15,26 @@ from urllib.parse import urlparse
 from ..agent import Agent
 from ..llm import LLM
 from ..mcp import MCPRegistry
+from .mods.shared import AssistantState, EXPERTS, SITE_MAPPINGS, load_site_mappings
+from .mods.supervisor_flow import HAS_LANGGRAPH, SupervisorFlowMixin
+from .mods.temp_caps import TempCapabilityMixin
 from .multi_agent_browser import BrowserTaskMixin
 from .multi_agent_file import FileTaskMixin
 from .multi_agent_mail import MailTaskMixin
 from .plan_engine import ExecutionPlanMixin
 from .session_context import AssistantSessionContext
+from .temp_input_adapters import create_default_temp_input_adapter_registry, extract_first_url
+from .temp_registry import TempCapabilityRecord, TempCapabilityRegistry
+from .temp_tool_template import TEMP_TOOL_TEMPLATE
 from ..tools.sandbox import (
     DEFAULT_SESSION_SNAPSHOT_NAME,
     SANDBOX_ROOT,
     ensure_within_sandbox,
+    sandbox_path,
 )
 
-try:
-    from langgraph.graph import END, StateGraph
 
-    HAS_LANGGRAPH = True
-except ImportError:
-    HAS_LANGGRAPH = False
-    END = "__end__"
-    StateGraph = None
-
-
-class AssistantState(TypedDict):
-    user_input: str
-    route: str
-    outputs: dict[str, str]
-    final_response: str
-
-
-@dataclass(frozen=True)
-class ExpertProfile:
-    name: str
-    route_key: str
-    system_hint: str
-    capabilities: tuple[str, ...]
-
-
-EXPERTS: tuple[ExpertProfile, ...] = (
-    ExpertProfile(
-        name="邮件专家",
-        route_key="mail",
-        system_hint="你只负责邮件信息检索与总结。若超出邮件范围，返回需要转交主管。",
-        capabilities=("mail", "notes"),
-    ),
-    ExpertProfile(
-        name="浏览器专家",
-        route_key="browser",
-        system_hint="你只负责浏览记录和网页链接分析。若工具不足，请明确说明。",
-        capabilities=("browser-history", "notes"),
-    ),
-    ExpertProfile(
-        name="编程专家",
-        route_key="coding",
-        system_hint="你是资深软件工程师，只做代码相关任务，优先给出可执行结果。",
-        capabilities=("filesystem", "shell", "code-search"),
-    ),
-    ExpertProfile(
-        name="文件专家",
-        route_key="file",
-        system_hint="你只负责文件整理、写作、总结与归档。",
-        capabilities=("filesystem", "notes"),
-    ),
-)
-
-_DEFAULT_SITE_MAPPINGS = {
-    "query_aliases": {
-        "知乎": "zhihu",
-        "github": "github",
-        "deepseek": "deepseek",
-        "学习通": "chaoxing",
-        "超星": "chaoxing",
-        "chaoxing": "chaoxing",
-        "b站": "bilibili",
-        "哔哩哔哩": "bilibili",
-        "微博": "weibo",
-        "微信": "wechat",
-        "代码仓库": "github",
-        "仓库": "github",
-        "开源项目": "github",
-        "论文": "arxiv",
-        "技术博客": "blog",
-    },
-    "canonical_query": {
-        "学习通": "chaoxing",
-        "超星学习通": "chaoxing",
-        "超星": "chaoxing",
-        "github": "github",
-        "知乎": "zhihu",
-        "微信": "wechat",
-    },
-    "strict_domains": {
-        "知乎": "zhihu.com",
-        "zhihu": "zhihu.com",
-        "github": "github.com",
-        "gitlab": "gitlab.com",
-        "deepseek": "deepseek.com",
-        "学习通": "chaoxing.com",
-        "超星": "chaoxing.com",
-        "chaoxing": "chaoxing.com",
-        "b站": "bilibili.com",
-        "哔哩哔哩": "bilibili.com",
-        "微博": "weibo.com",
-        "微信": "weixin.qq.com",
-        "x": "x.com",
-        "twitter": "x.com",
-    },
-}
-
-
-def _load_site_mappings() -> dict:
-    cfg_path = Path(__file__).resolve().parent / "browser_site_mappings.json"
-    if not cfg_path.exists():
-        return _DEFAULT_SITE_MAPPINGS
-    try:
-        data = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except Exception:
-        return _DEFAULT_SITE_MAPPINGS
-
-    merged = {
-        "query_aliases": dict(_DEFAULT_SITE_MAPPINGS["query_aliases"]),
-        "canonical_query": dict(_DEFAULT_SITE_MAPPINGS["canonical_query"]),
-        "strict_domains": dict(_DEFAULT_SITE_MAPPINGS["strict_domains"]),
-    }
-    for key in merged:
-        value = data.get(key)
-        if isinstance(value, dict):
-            merged[key].update({str(k): str(v) for k, v in value.items()})
-    return merged
-
-
-_SITE_MAPPINGS = _load_site_mappings()
-
-
-def _route_intent(user_input: str, ctx: AssistantSessionContext | None = None) -> str:
-    text = user_input.lower()
-    if any(k in text for k in ("邮件", "gmail", "mail")):
-        return "mail"
-    # Session-aware follow-ups (same REPL instance keeps `ctx`).
-    if ctx:
-        if ctx.last_file_path and ctx.last_route == "browser":
-            if any(k in user_input for k in ("刚才", "刚刚", "上面", "这个文件", "保存的", "写入的")) and any(
-                k in user_input for k in ("内容", "格式", "json", "合法", "修正", "改成", "读取", "验证")
-            ):
-                return "file"
-        if ctx.last_route == "file" and len(user_input.strip()) < 40:
-            if any(k in user_input for k in ("继续", "同样", "再来一遍", "再试")):
-                return "file"
-        if ctx.last_file_path and ctx.last_route == "file":
-            if any(k in user_input for k in ("继续", "再保存", "覆盖", "重写")):
-                return "file"
-        if ctx.last_file_path and ctx.last_file_path.lower().endswith(".json"):
-            if len(user_input.strip()) < 72 and any(
-                k in user_input for k in ("合法", "标准json", "json格式", "格式化", "美化", "修正内容")
-            ):
-                if "浏览" not in text and "chrome" not in text:
-                    return "file"
-    if any(k in text for k in ("浏览", "chrome", "history", "网页", "链接", "站点", "记录", "网址")):
-        return "browser"
-    # Follow-ups about files under sandbox / JSON content (avoid mis-routing to coding).
-    norm = text.replace("\\\\", "\\")
-    if "corecodertest" in norm or ".json" in text or ".txt" in text:
-        if any(
-            k in user_input
-            for k in (
-                "读取",
-                "验证",
-                "格式",
-                "重写",
-                "修正",
-                "改成",
-                "保存",
-                "写入",
-                "刚刚",
-                "内容",
-                "合法",
-                "文件",
-                "test1",
-            )
-        ):
-            return "file"
-    if "json" in text and any(k in user_input for k in ("内容", "格式", "合法", "修正", "改成")):
-        return "file"
-    if any(k in text for k in ("文档", "文件", "总结", "简报", "笔记")):
-        return "file"
-    return "coding"
-
-
-class SuperAssistant(ExecutionPlanMixin, BrowserTaskMixin, MailTaskMixin, FileTaskMixin):
+class SuperAssistant(TempCapabilityMixin, SupervisorFlowMixin, ExecutionPlanMixin, BrowserTaskMixin, MailTaskMixin, FileTaskMixin):
     """Supervisor + experts orchestration with optional LangGraph backend."""
 
     def __init__(
@@ -209,13 +44,14 @@ class SuperAssistant(ExecutionPlanMixin, BrowserTaskMixin, MailTaskMixin, FileTa
         *,
         persist_session: bool = False,
         session_snapshot_path: str | None = None,
+        autoload_kept_temp_tools: bool = False,
     ):
         self.llm = llm
         self.mcp_registry = mcp_registry or MCPRegistry()
         self._experts = {profile.route_key: self._build_expert(profile) for profile in EXPERTS}
         self._hints = {profile.route_key: profile.system_hint for profile in EXPERTS}
         self._graph = self._build_graph() if HAS_LANGGRAPH else None
-        self._site_mappings = _SITE_MAPPINGS
+        self._site_mappings = SITE_MAPPINGS
         self._session_snapshot_path = self._resolve_snapshot_path(session_snapshot_path)
         self._session_persist = bool(persist_session)
         self.context = AssistantSessionContext()
@@ -224,7 +60,78 @@ class SuperAssistant(ExecutionPlanMixin, BrowserTaskMixin, MailTaskMixin, FileTa
         self._plan_registry: list[tuple[str, Callable[[str], dict[str, object] | None]]] = []
         self._plan_risk_policy: dict[str, dict[str, object]] = {}
         self._step_executor_registry: dict[str, Callable[[dict[str, Any], dict[str, str], list[str]], str | None]] = {}
+        self._temp_registry = TempCapabilityRegistry(
+            self,
+            sandbox_path(".temp_tools"),
+            sandbox_path(".kept_tools"),
+        )
+        self._temp_registry.set_autoload_kept(bool(autoload_kept_temp_tools))
+        self._pending_temp_capability: dict[str, Any] | None = None
+        # For "open/execute" UX: an interactive runtime dialog that collects/confirm args
+        # before invoking the temporary capability.
+        self._pending_temp_capability_dialog: dict[str, Any] | None = None
+        self._last_temp_capability_failure: dict[str, Any] | None = None
+        self._temp_input_adapters = create_default_temp_input_adapter_registry()
+        self._coding_toolsmith_enabled: bool = False
+        self._coding_quality_team_enabled: bool = False
+        api_key = (
+            os.getenv("CORECODER_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+            or os.getenv("DEEPSEEK_API_KEY")
+            or ""
+        )
+        base_url = (
+            os.getenv("CORECODER_BASE_URL")
+            or os.getenv("OPENAI_BASE_URL")
+            or os.getenv("DEEPSEEK_BASE_URL")
+            or None
+        )
+        self._review_llm = self._build_specialist_llm(
+            role_env="REVIEW",
+            default_model=self.llm.model or "qwen3-coder-30b",
+            default_api_key=api_key,
+            default_base_url=base_url,
+            temperature=0.0,
+            max_tokens=4096,
+        )
+        self._repair_llm = self._build_specialist_llm(
+            role_env="FIX",
+            default_model=self.llm.model or "qwen3-coder-30b",
+            default_api_key=api_key,
+            default_base_url=base_url,
+            temperature=0.1,
+            max_tokens=4096,
+        )
+        self._verify_llm = self._build_specialist_llm(
+            role_env="VERIFY",
+            default_model=self.llm.model or "qwen3-coder-30b",
+            default_api_key=api_key,
+            default_base_url=base_url,
+            temperature=0.0,
+            max_tokens=4096,
+        )
+        self._format_llm = self._build_specialist_llm(
+            role_env="FORMAT",
+            default_model=self.llm.model or "qwen3-coder-30b",
+            default_api_key=api_key,
+            default_base_url=base_url,
+            temperature=0.0,
+            max_tokens=2048,
+        )
+
+        # Coding expert LLM for temporary tool chain.
+        # 普通对话仍使用 self.llm（主模型）；临时工具链生成/自修复才走这里。
+        self._temp_tool_coding_llm = self._build_specialist_llm(
+            role_env="CODING_TOOLSMITH",
+            default_model=self.llm.model or "qwen3-coder-30b",
+            default_api_key=api_key,
+            default_base_url=base_url,
+            temperature=0.0,
+            max_tokens=8192,
+        )
         self._init_execution_plan_engine()
+        if bool(autoload_kept_temp_tools):
+            self._temp_registry.autoload_kept_capabilities()
         if self._session_persist:
             loaded = AssistantSessionContext.read_snapshot(self._session_snapshot_path)
             if loaded is not None:
@@ -232,9 +139,7 @@ class SuperAssistant(ExecutionPlanMixin, BrowserTaskMixin, MailTaskMixin, FileTa
 
     def reload_mappings(self) -> dict[str, int]:
         """Hot-reload browser site mappings from JSON config."""
-        global _SITE_MAPPINGS
-        _SITE_MAPPINGS = _load_site_mappings()
-        self._site_mappings = _SITE_MAPPINGS
+        self._site_mappings = load_site_mappings()
         return {
             "query_aliases": len(self._site_mappings.get("query_aliases", {})),
             "canonical_query": len(self._site_mappings.get("canonical_query", {})),
@@ -262,25 +167,194 @@ class SuperAssistant(ExecutionPlanMixin, BrowserTaskMixin, MailTaskMixin, FileTa
 
     def show_registered_actions(self) -> list[str]:
         """Return current registered step action executors."""
-        return sorted(self._step_executor_registry.keys())
+        temp_actions = []
+        if hasattr(self, "_temp_registry"):
+            temp_actions = list(self._temp_registry.step_executors.keys())
+        return sorted(set(self._step_executor_registry.keys()) | set(temp_actions))
 
-    def orchestration_debug_preview(self) -> str:
-        """Human-readable orchestration registry debug panel."""
-        planners = self.show_registered_planners()
-        actions = self.show_registered_actions()
-        lines = [
-            "[Orchestration Registry]",
-            f"planners({len(planners)}): {', '.join(planners) if planners else '(none)'}",
-            f"actions({len(actions)}): {', '.join(actions) if actions else '(none)'}",
-            "risk_policy:",
-        ]
-        for k in sorted(self._plan_risk_policy.keys()):
-            v = self._plan_risk_policy[k]
-            lines.append(f"  - {k}: requires_confirmation={bool(v.get('requires_confirmation', True))}")
-        if hasattr(self, "path_search_debug_preview"):
-            lines.append("")
-            lines.append(self.path_search_debug_preview())
-        return "\n".join(lines)
+    def show_temp_capabilities(self) -> list[dict[str, object]]:
+        if not hasattr(self, "_temp_registry"):
+            return []
+        rows: list[dict[str, object]] = []
+        for item in self._temp_registry.list_records():
+            row = self._temp_registry.export_record_dict(item.name)
+            if row:
+                rows.append(row)
+        return rows
+
+    def show_kept_capabilities(self) -> list[str]:
+        if not hasattr(self, "_temp_registry"):
+            return []
+        return [str(path) for path in self._temp_registry.list_kept_files()]
+
+    def show_qc_reports(self, limit: int = 10) -> list[dict[str, str]]:
+        root = sandbox_path(".temp_tools", "_qc_reports")
+        try:
+            rows: list[dict[str, str]] = []
+            for p in sorted(root.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)[: max(1, int(limit or 10))]:
+                rows.append(
+                    {
+                        "name": p.name,
+                        "path": str(p),
+                        "modified_at": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
+                    }
+                )
+            return rows
+        except Exception:
+            return []
+
+    def get_qc_report_summary(self, name_or_path: str) -> tuple[bool, dict[str, Any] | str]:
+        value = str(name_or_path or "").strip()
+        if not value:
+            return False, "empty report name"
+        root = sandbox_path(".temp_tools", "_qc_reports")
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = root / value
+        if candidate.suffix.lower() != ".json":
+            candidate = candidate.with_suffix(".json")
+        if not candidate.exists():
+            return False, f"report not found: {candidate.name}"
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+            result = data.get("result", {}) if isinstance(data, dict) else {}
+            models = data.get("models", {}) if isinstance(data, dict) else {}
+            round_data = data.get("round", {}) if isinstance(data, dict) else {}
+            review = round_data.get("review", {}) if isinstance(round_data, dict) else {}
+            verify = round_data.get("verify", {}) if isinstance(round_data, dict) else {}
+            summary = {
+                "name": candidate.name,
+                "path": str(candidate),
+                "timestamp_utc": str(data.get("timestamp_utc", "")),
+                "requirement": str(data.get("requirement", "")),
+                "iteration_mode": str(data.get("iteration_mode", "fix")),
+                "capability_delta": data.get("capability_delta", []) if isinstance(data.get("capability_delta", []), list) else [],
+                "models": {
+                    "review": str(models.get("review", "")),
+                    "repair": str(models.get("repair", "")),
+                    "verify": str(models.get("verify", "")),
+                },
+                "review": {
+                    "approved": bool(review.get("approved", False)),
+                    "risk_level": str(review.get("risk_level", "")),
+                    "issues_count": len(review.get("issues", [])) if isinstance(review.get("issues", []), list) else 0,
+                },
+                "verify": {
+                    "pass": bool(verify.get("pass", False)),
+                    "reason": str(verify.get("reason", "")),
+                    "must_fix_count": len(verify.get("must_fix", [])) if isinstance(verify.get("must_fix", []), list) else 0,
+                },
+                "trace": result.get("trace", []) if isinstance(result.get("trace", []), list) else [],
+            }
+            return True, summary
+        except Exception as exc:
+            return False, str(exc)
+
+    def set_autoload_kept_temp_tools(self, enabled: bool) -> bool:
+        self._temp_registry.set_autoload_kept(enabled)
+        return self._temp_registry.autoload_kept
+
+    def autoload_kept_temp_tools(self) -> list[str]:
+        return self._temp_registry.autoload_kept_capabilities()
+
+    def load_temp_capability(
+        self,
+        value: str,
+        *,
+        source_requirement: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        try:
+            target = self._temp_registry.resolve_candidate(value)
+            record = self._temp_registry.load_from_file(
+                target,
+                source_requirement=source_requirement,
+                metadata=metadata,
+            )
+            return True, f"{record.name} ({record.action_name})"
+        except Exception as exc:
+            return False, str(exc)
+
+    def discard_temp_capability(self, name: str) -> bool:
+        return self._temp_registry.discard(name, delete_file=True)
+
+    def keep_temp_capability(self, name: str) -> tuple[bool, str]:
+        return self._temp_registry.keep(name)
+
+    def clear_temp_capabilities(self) -> int:
+        return self._temp_registry.clear_temp()
+
+    def temp_capabilities_debug_preview(self) -> str:
+        return self._temp_registry.debug_preview()
+
+    @staticmethod
+    def _build_specialist_llm(
+        *,
+        role_env: str,
+        default_model: str,
+        default_api_key: str,
+        default_base_url: str | None,
+        temperature: float,
+        max_tokens: int,
+    ) -> LLM:
+        model = (
+            os.getenv(f"CORECODER_{role_env}_EXPERT_MODEL", "").strip()
+            or os.getenv("CORECODER_SPECIALIST_MODEL", "").strip()
+            or default_model
+            or "qwen3-coder-30b"
+        )
+        api_key = (
+            os.getenv(f"CORECODER_{role_env}_EXPERT_API_KEY", "").strip()
+            or os.getenv("CORECODER_SPECIALIST_API_KEY", "").strip()
+            or default_api_key
+            or "dummy"
+        )
+        base_url = (
+            os.getenv(f"CORECODER_{role_env}_EXPERT_BASE_URL", "").strip()
+            or os.getenv("CORECODER_SPECIALIST_BASE_URL", "").strip()
+            or default_base_url
+            or None
+        )
+        return LLM(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+    def sync_specialist_llms(self, *, model: str, base_url: str | None, api_key: str) -> None:
+        for attr in ("_review_llm", "_repair_llm", "_verify_llm", "_format_llm"):
+            llm_obj = getattr(self, attr, None)
+            if llm_obj is None:
+                continue
+            setattr(
+                self,
+                attr,
+                LLM(
+                    model=model,
+                    api_key=api_key or "dummy",
+                    base_url=base_url,
+                    temperature=llm_obj.temperature,
+                    max_tokens=llm_obj.max_tokens,
+                    timeout=llm_obj.timeout,
+                ),
+            )
+
+    def set_coding_toolsmith(self, enabled: bool) -> bool:
+        self._coding_toolsmith_enabled = bool(enabled)
+        self._coding_quality_team_enabled = bool(enabled)
+        if not self._coding_toolsmith_enabled:
+            self._pending_temp_capability = None
+            self._pending_temp_capability_dialog = None
+            # Do not persist temp capabilities into kept tools; no save dialog.
+        return self._coding_toolsmith_enabled
+
+    def coding_toolsmith_enabled(self) -> bool:
+        return bool(self._coding_toolsmith_enabled)
+
+    def coding_quality_team_enabled(self) -> bool:
+        return bool(self._coding_quality_team_enabled)
 
     @staticmethod
     def _resolve_snapshot_path(session_snapshot_path: str | None) -> Path:
@@ -366,242 +440,6 @@ class SuperAssistant(ExecutionPlanMixin, BrowserTaskMixin, MailTaskMixin, FileTa
         if block:
             parts.append(block)
         return "\n".join(parts)
-
-    def run(self, user_input: str) -> str:
-        clarify_followup = self._handle_pending_semantic_clarify(user_input)
-        if clarify_followup is not None:
-            return clarify_followup
-        plan_followup = self._handle_pending_execution_plan(user_input)
-        if plan_followup is not None:
-            return plan_followup
-        stage = self._maybe_stage_execution_plan(user_input)
-        if stage is not None:
-            return stage
-        cross = self._run_cross_expert_task(user_input)
-        if cross is not None:
-            return cross
-        clarify = self._maybe_ask_route_clarification(user_input)
-        if clarify:
-            return clarify
-        state: AssistantState = {
-            "user_input": user_input,
-            "route": "coding",
-            "outputs": {},
-            "final_response": "",
-        }
-        if self._graph is not None:
-            result = self._graph.invoke(state)
-            return result["final_response"]
-        return self._run_fallback(state)
-
-
-    def _build_expert(self, profile: ExpertProfile) -> Agent:
-        tools = self.mcp_registry.tools_for_capabilities(list(profile.capabilities))
-        return Agent(llm=self.llm, tools=tools, skills=[])
-
-    def _run_fallback(self, state: AssistantState) -> str:
-        state["route"] = self._decide_route_with_confidence(state["user_input"])["route"]
-        result = self._run_route_task(state["route"], state["user_input"])
-        state["outputs"][state["route"]] = result
-        state["final_response"] = self._format_supervisor_response(state["route"], result)
-        self._record_session_turn(state["user_input"], state["route"], result)
-        return state["final_response"]
-
-    def _build_graph(self):
-        graph = StateGraph(AssistantState)
-        graph.add_node("supervisor", self._supervisor_node)
-        for profile in EXPERTS:
-            graph.add_node(profile.route_key, self._make_expert_node(profile.route_key))
-        graph.add_node("finalize", self._finalize_node)
-
-        graph.set_entry_point("supervisor")
-        for profile in EXPERTS:
-            graph.add_edge(profile.route_key, "finalize")
-        graph.add_conditional_edges(
-            "supervisor",
-            lambda state: state["route"],
-            {profile.route_key: profile.route_key for profile in EXPERTS},
-        )
-        graph.add_edge("finalize", END)
-        return graph.compile()
-
-    def _supervisor_node(self, state: AssistantState) -> AssistantState:
-        state["route"] = self._decide_route_with_confidence(state["user_input"])["route"]
-        return state
-
-    def _parse_route_intent(self, user_input: str) -> dict:
-        schema = {
-            "route": "unknown",
-            "confidence": 0.0,
-            "needs_clarification": False,
-            "reason": "",
-        }
-        prompt = (
-            "你是主管路由意图解析器。把用户输入解析为JSON，仅返回JSON。\n"
-            "字段：route(mail/browser/file/coding/unknown), confidence(0~1), needs_clarification(bool), reason。\n"
-            "规则：\n"
-            "1) 邮件/Gmail -> mail；浏览记录/网页历史/网址 -> browser；文件读写整理/格式转换 -> file；其余代码开发 -> coding。\n"
-            "2) 当表达含糊且可能跨两个及以上专家时，needs_clarification=true。\n"
-            f"默认值: {json.dumps(schema, ensure_ascii=False)}\n"
-            f"用户输入: {user_input}"
-        )
-        parsed = self._parse_intent_json(prompt, schema)
-        route = str(parsed.get("route", "unknown")).strip().lower()
-        if route not in ("mail", "browser", "file", "coding", "unknown"):
-            route = "unknown"
-        conf = float(parsed.get("confidence", 0.0) or 0.0)
-        conf = max(0.0, min(conf, 1.0))
-        return {
-            "route": route,
-            "confidence": conf,
-            "needs_clarification": bool(parsed.get("needs_clarification", False)),
-            "reason": str(parsed.get("reason", "")).strip(),
-        }
-
-    def _decide_route_with_confidence(self, user_input: str) -> dict[str, object]:
-        parsed = self._parse_route_intent(user_input)
-        fallback = _route_intent(user_input, self.context)
-        text = user_input.lower()
-        signals = {
-            "mail": any(k in text for k in ("邮件", "gmail", "mail")),
-            "browser": any(k in text for k in ("浏览", "chrome", "history", "网页", "链接", "站点", "记录", "网址")),
-            "file": any(k in user_input for k in ("文件", "读取", "写入", "保存", "覆盖", "格式", "json", "文本", ".json", ".txt")),
-            "coding": any(k in text for k in ("代码", "函数", "编程", "bug", "修复", "重构", "python", "java", "typescript", "git")),
-        }
-        active = [k for k, v in signals.items() if v]
-        route = parsed["route"] if parsed["route"] != "unknown" else fallback
-        conf = float(parsed["confidence"])
-        if route == "unknown":
-            route = fallback
-            conf = 0.5
-        # deterministic guardrail: when parser and fallback conflict, trust fallback on low confidence
-        if route != fallback and conf < 0.78:
-            route = fallback
-            conf = max(conf, 0.68)
-        needs = bool(parsed["needs_clarification"])
-        if len(active) >= 2 and conf < 0.72:
-            needs = True
-        return {
-            "route": route,
-            "confidence": conf,
-            "needs_clarification": needs,
-            "reason": parsed["reason"],
-            "signals": active,
-            "fallback_route": fallback,
-        }
-
-    def _maybe_ask_route_clarification(self, user_input: str) -> str | None:
-        decision = self._decide_route_with_confidence(user_input)
-        if not decision.get("needs_clarification", False):
-            return None
-        if float(decision.get("confidence", 0.0)) >= 0.72:
-            return None
-        return self._format_evidence_result(
-            summary="检测到跨专家意图，先确认你的目标再执行，避免误解。",
-            route_key="file",
-            evidence_lines=[
-                f"route_decision={decision}",
-                f"context_last_route={self.context.last_route!r}",
-            ],
-            detail=(
-                "请回复一个选项：\n"
-                "A) 浏览器任务（查/导出浏览记录）\n"
-                "B) 邮件任务（发送/回复/删除）\n"
-                "C) 文件任务（读写、格式转换、覆盖）\n"
-                "D) 编程任务（改代码/调试）\n"
-                "也可以直接说：'把浏览器最近3条发送到 xx@qq.com，主题 xx'。"
-            ),
-        )
-
-    def _run_cross_expert_task(self, user_input: str) -> str | None:
-        """
-        Deterministic bridge for high-frequency multi-expert intent:
-        browser-history -> email send.
-        """
-        text = user_input.strip()
-        lower = text.lower()
-        has_browser = any(k in text for k in ("浏览器", "历史", "记录")) or any(k in lower for k in ("chrome", "history"))
-        has_send_mail = any(k in text for k in ("发送给", "发给", "发送到", "发邮件给", "邮箱")) or "send" in lower
-        to = self._extract_email_address(text)
-        if not (has_browser and has_send_mail and to):
-            return None
-
-        browser_expert = self._experts.get("browser")
-        mail_expert = self._experts.get("mail")
-        if browser_expert is None or mail_expert is None:
-            return None
-        btool = next((t for t in browser_expert.tools if t.name == "browser_history"), None)
-        send_tool = next((t for t in mail_expert.tools if t.name == "gmail_send_email"), None)
-        if btool is None or send_tool is None:
-            return None
-
-        limit = self._extract_result_limit(text, default=3)
-        raw = btool.execute(query="", limit=limit, strict_domain="")
-        if raw.startswith("Error:") or raw.startswith("No "):
-            return self._format_evidence_result(
-                summary="跨专家任务触发成功，但浏览记录读取失败。",
-                route_key="browser",
-                evidence_lines=[f"tool=browser_history args={{'query': '', 'limit': {limit}, 'strict_domain': ''}}"],
-                detail=raw,
-            )
-        subject, body_hint = self._parse_mail_subject_body(text)
-        subject = subject or "浏览器记录"
-        mail_body = (
-            (body_hint.strip() + "\n\n" if body_hint.strip() else "")
-            + f"以下是最近 {limit} 条浏览器记录：\n\n"
-            + raw
-        )
-        send_result = send_tool.execute(to=to, subject=subject, body=mail_body)
-        return self._format_evidence_result(
-            summary="已执行跨专家任务：浏览记录整理并发送邮件。",
-            route_key="mail",
-            evidence_lines=[
-                f"tool=browser_history args={{'query': '', 'limit': {limit}, 'strict_domain': ''}}",
-                f"tool=gmail_send_email args={{'to': {to!r}, 'subject': {subject!r}, 'body': '<browser history>'}}",
-            ],
-            detail=send_result,
-        )
-
-    def _make_expert_node(self, route_key: str):
-        def _node(state: AssistantState) -> AssistantState:
-            result = self._run_route_task(route_key, state["user_input"])
-            state["outputs"][route_key] = result
-            return state
-
-        return _node
-
-    def _finalize_node(self, state: AssistantState) -> AssistantState:
-        route = state["route"]
-        result = state["outputs"].get(route, "")
-        state["final_response"] = self._format_supervisor_response(route, result)
-        self._record_session_turn(state["user_input"], route, result)
-        return state
-
-    @staticmethod
-    def _format_supervisor_response(route: str, expert_result: str) -> str:
-        role_map = {
-            "mail": "邮件专家",
-            "browser": "浏览器专家",
-            "coding": "编程专家",
-            "file": "文件专家",
-        }
-        role = role_map.get(route, "专家")
-        return f"【Supervisor】已分派给{role}，执行结果如下：\n\n{expert_result}"
-
-    def _build_expert_prompt(self, route_key: str, user_input: str) -> str:
-        hint = self._hints.get(route_key, "你是专业助手。")
-        browser_hint = ""
-        if route_key == "browser":
-            browser_hint = (
-                "\n你必须优先使用 browser_history 工具完成任务。"
-                "该工具支持 query(关键词过滤) 与 limit(数量上限)。"
-            )
-        return (
-            f"角色约束：{hint}\n"
-            "请基于当前角色完成任务。如果任务超出职责，明确说明需要主管转派。"
-            f"{browser_hint}\n\n"
-            f"用户任务：{user_input}"
-        )
 
     def _run_browser_task(self, user_input: str) -> str:
         return BrowserTaskMixin._run_browser_task(self, user_input)

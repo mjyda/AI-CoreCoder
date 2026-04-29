@@ -13,6 +13,7 @@ from .grep_in_files import GrepInFilesTool
 from .file_info import FileInfoTool
 from .agent import AgentTool
 from .browser_history import BrowserHistoryTool
+from .fetch_url_content import FetchUrlContentTool
 from .mail_imap import (
     GmailDeleteEmailTool,
     GmailGetContentTool,
@@ -37,6 +38,7 @@ ALL_TOOLS = [
     GlobTool(),
     GrepTool(),
     BrowserHistoryTool(),
+    FetchUrlContentTool(),
     GmailListRecentTool(),
     GmailSearchTool(),
     GmailGetContentTool(),

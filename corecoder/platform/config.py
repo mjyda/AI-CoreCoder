@@ -37,6 +37,7 @@ class Config:
     # Persist SuperAssistant session context to disk (cross-restart “memory”).
     session_persist: bool = False
     session_snapshot_path: str = ""
+    autoload_kept_temp_tools: bool = False
 
     @classmethod#绑定到类而不是实例的方法
     def from_env(cls) -> "Config":
@@ -59,4 +60,5 @@ class Config:
             super_assistant=os.getenv("CORECODER_SUPER_ASSISTANT", "").lower() in ("1", "true", "yes", "on"),
             session_persist=os.getenv("CORECODER_SESSION_PERSIST", "").lower() in ("1", "true", "yes", "on"),
             session_snapshot_path=os.getenv("CORECODER_SESSION_PATH", "").strip(),
+            autoload_kept_temp_tools=os.getenv("CORECODER_AUTOLOAD_KEPT_TEMP_TOOLS", "").lower() in ("1", "true", "yes", "on"),
         )

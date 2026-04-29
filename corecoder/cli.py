@@ -4,6 +4,8 @@ import sys
 import os
 import argparse
 import re
+from urllib import request as urlrequest, error as urlerror
+import json
 
 # Fix Windows encoding issues
 if sys.platform == 'win32':
@@ -58,6 +60,66 @@ _TASK_INTENT_KEYWORDS = (
     "test",
     "audit",
 )
+
+
+def _probe_openai_compatible(base_url: str, model: str, api_key: str, timeout_s: float = 2.5) -> tuple[bool, str]:
+    base = (base_url or "").rstrip("/")
+    if not base:
+        return False, "empty base url"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key or 'dummy'}"}
+    # 1) try /models first (cheaper, no generation)
+    try:
+        req = urlrequest.Request(f"{base}/models", headers=headers, method="GET")
+        with urlrequest.urlopen(req, timeout=timeout_s) as resp:
+            if 200 <= int(resp.status) < 300:
+                return True, "ok:/models"
+    except Exception:
+        pass
+    # 2) fallback minimal chat completion probe
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 4,
+        "temperature": 0.0,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    try:
+        req = urlrequest.Request(f"{base}/chat/completions", data=data, headers=headers, method="POST")
+        with urlrequest.urlopen(req, timeout=timeout_s) as resp:
+            if 200 <= int(resp.status) < 300:
+                return True, "ok:/chat/completions"
+            return False, f"http={resp.status}"
+    except urlerror.HTTPError as exc:
+        return False, f"http={exc.code}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _apply_backend_runtime(
+    agent: Agent,
+    super_assistant: SuperAssistant,
+    config: Config,
+    *,
+    model: str,
+    base_url: str | None,
+    api_key: str,
+) -> None:
+    new_llm = LLM(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=config.temperature,
+        max_tokens=config.max_tokens,
+    )
+    agent.llm = new_llm
+    super_assistant.llm = new_llm
+    for exp in getattr(super_assistant, "_experts", {}).values():
+        exp.llm = new_llm
+    if hasattr(super_assistant, "sync_specialist_llms"):
+        super_assistant.sync_specialist_llms(model=model, base_url=base_url, api_key=api_key)
+    config.model = model
+    config.base_url = base_url
+    config.api_key = api_key
 
 
 def _api_key_setup_examples() -> str:
@@ -163,6 +225,7 @@ def main():
         llm=llm,
         persist_session=config.session_persist,
         session_snapshot_path=_ssp if _ssp else None,
+        autoload_kept_temp_tools=config.autoload_kept_temp_tools,
     )
 
     # resume saved session
@@ -320,10 +383,115 @@ def _repl(agent: Agent, config: Config, super_assistant: SuperAssistant):
             new_model = user_input[7:].strip() if user_input.startswith("/model ") else ""
             if new_model:
                 agent.llm.model = new_model
+                if hasattr(super_assistant, "llm"):
+                    super_assistant.llm.model = new_model
+                for exp in getattr(super_assistant, "_experts", {}).values():
+                    exp.llm.model = new_model
                 config.model = new_model
                 console.print(f"Switched to [cyan]{new_model}[/cyan]")
             else:
                 console.print(f"Current model: [cyan]{config.model}[/cyan]")
+            continue
+        if user_input == "/model-backend" or user_input.startswith("/model-backend "):
+            arg = user_input[len("/model-backend"):].strip().lower()
+            if not arg:
+                console.print(
+                    "Backend status: "
+                    f"model=[cyan]{config.model}[/cyan], "
+                    f"base=[cyan]{config.base_url or '(none)'}[/cyan]"
+                )
+                continue
+            if arg not in ("local", "cloud"):
+                console.print("[yellow]Usage: /model-backend local|cloud[/yellow]")
+                continue
+            if arg == "local":
+                local_model = os.getenv("CORECODER_LOCAL_MODEL", "qwen3-coder-30b").strip() or "qwen3-coder-30b"
+                candidates = [
+                    os.getenv("CORECODER_LOCAL_BASE_URL_WIRED", "").strip(),
+                    os.getenv("CORECODER_LOCAL_BASE_URL_WLAN", "").strip(),
+                    "http://10.204.220.21:8000/v1",
+                    "http://10.45.164.21:8000/v1",
+                ]
+                seen: set[str] = set()
+                candidate_rows: list[str] = []
+                selected: str | None = None
+                for base in candidates:
+                    b = (base or "").strip()
+                    if not b or b in seen:
+                        continue
+                    seen.add(b)
+                    ok, detail = _probe_openai_compatible(b, local_model, config.api_key or "dummy")
+                    candidate_rows.append(f"{b} => {'ok' if ok else 'fail'} ({detail})")
+                    if ok and selected is None:
+                        selected = b
+                if not selected:
+                    console.print(
+                        Panel(
+                            "Local backend detect failed.\n"
+                            + "\n".join(f"- {x}" for x in candidate_rows),
+                            title="Model Backend Switch",
+                            border_style="red",
+                        )
+                    )
+                    continue
+                api_key = config.api_key or os.getenv("CORECODER_API_KEY") or os.getenv("OPENAI_API_KEY") or "dummy"
+                _apply_backend_runtime(
+                    agent,
+                    super_assistant,
+                    config,
+                    model=local_model,
+                    base_url=selected,
+                    api_key=api_key,
+                )
+                console.print(
+                    Panel(
+                        "Switched to local backend.\n"
+                        f"- model={local_model}\n"
+                        f"- base={selected}\n"
+                        + "\n".join(f"- probe {x}" for x in candidate_rows),
+                        title="Model Backend Switch",
+                        border_style="green",
+                    )
+                )
+                continue
+            # cloud
+            cloud_model = (
+                os.getenv("CORECODER_CLOUD_MODEL", "").strip()
+                or os.getenv("CORECODER_MODEL", "").strip()
+                or config.model
+            )
+            cloud_base = (
+                os.getenv("CORECODER_CLOUD_BASE_URL", "").strip()
+                or os.getenv("OPENAI_BASE_URL", "").strip()
+                or os.getenv("CORECODER_BASE_URL", "").strip()
+                or config.base_url
+            )
+            cloud_key = (
+                os.getenv("CORECODER_API_KEY")
+                or os.getenv("OPENAI_API_KEY")
+                or os.getenv("DEEPSEEK_API_KEY")
+                or config.api_key
+            )
+            if not cloud_key:
+                console.print("[red]Cloud backend switch failed: missing API key.[/red]")
+                continue
+            _apply_backend_runtime(
+                agent,
+                super_assistant,
+                config,
+                model=cloud_model,
+                base_url=cloud_base,
+                api_key=cloud_key,
+            )
+            console.print(
+                Panel(
+                    "Switched to cloud backend.\n"
+                    f"- model={cloud_model}\n"
+                    f"- base={cloud_base or '(provider default)'}",
+                    title="Model Backend Switch",
+                    border_style="green",
+                )
+            )
             continue
         if user_input == "/compact":#压缩对话历史信息
             from .context import estimate_tokens
@@ -456,6 +624,29 @@ def _repl(agent: Agent, config: Config, super_assistant: SuperAssistant):
             else:
                 console.print("[yellow]Usage: /assistant on|off[/yellow]")
             continue
+        if user_input == "/coding-toolsmith" or user_input.startswith("/coding-toolsmith "):
+            if not config.super_assistant:
+                console.print("[yellow]Super assistant mode is off. Use /assistant on first.[/yellow]")
+                continue
+            arg = user_input[len("/coding-toolsmith"):].strip().lower()
+            if not arg:
+                state = "on" if super_assistant.coding_toolsmith_enabled() else "off"
+                qc_state = "on" if super_assistant.coding_quality_team_enabled() else "off"
+                console.print(
+                    f"Coding toolsmith mode is [cyan]{state}[/cyan] "
+                    f"(review/fix/verify team: [cyan]{qc_state}[/cyan])"
+                )
+                continue
+            if arg in ("on", "off"):
+                enabled = super_assistant.set_coding_toolsmith(arg == "on")
+                state = "on" if enabled else "off"
+                console.print(
+                    f"Coding toolsmith mode switched [cyan]{state}[/cyan] "
+                    "(coding + review + fix + verify enabled state synced)"
+                )
+                continue
+            console.print("[yellow]Usage: /coding-toolsmith on|off[/yellow]")
+            continue
         if user_input == "/reload-mappings":
             if not config.super_assistant:
                 console.print("[yellow]Super assistant mode is off. Use /assistant on first.[/yellow]")
@@ -492,6 +683,203 @@ def _repl(agent: Agent, config: Config, super_assistant: SuperAssistant):
                 lines = ["[bold cyan]File expert available tools:[/bold cyan]"]
                 lines.extend(f"  - {name}" for name in tools)
                 console.print(Panel("\n".join(lines), title="File Expert Tools", border_style="cyan"))
+            continue
+        if user_input == "/temp-tools":
+            if not config.super_assistant:
+                console.print("[yellow]Super assistant mode is off. Use /assistant on first.[/yellow]")
+                continue
+            rows = super_assistant.show_temp_capabilities()
+            if not rows:
+                console.print("[dim]No temporary capabilities loaded.[/dim]")
+            else:
+                lines = ["[bold cyan]Temporary capabilities:[/bold cyan]"]
+                for row in rows:
+                    lines.append(
+                        f"- {row['name']} | action={row['action_name']} | route={row['route']} | status={row['status']}"
+                    )
+                    lines.append(f"  file={row['file_path']}")
+                console.print(Panel("\n".join(lines), title="Temp Capabilities", border_style="cyan"))
+            continue
+        if user_input == "/temp-retry" or user_input.startswith("/temp-retry "):
+            if not config.super_assistant:
+                console.print("[yellow]Super assistant mode is off. Use /assistant on first.[/yellow]")
+                continue
+            arg = user_input[len("/temp-retry"):].strip()
+            rounds = 1
+            customization = ""
+            if arg:
+                parts = arg.split(maxsplit=1)
+                try:
+                    rounds = max(1, min(int(parts[0]), 5))
+                    customization = parts[1].strip() if len(parts) > 1 else ""
+                except ValueError:
+                    rounds = 1
+                    customization = arg
+            console.print(
+                Panel(
+                    super_assistant.retry_last_temp_failure(rounds, customization),
+                    title="Temp Retry",
+                    border_style="cyan",
+                )
+            )
+            continue
+        if user_input == "/temp-evolve" or user_input.startswith("/temp-evolve "):
+            if not config.super_assistant:
+                console.print("[yellow]Super assistant mode is off. Use /assistant on first.[/yellow]")
+                continue
+            arg = user_input[len("/temp-evolve"):].strip()
+            rounds = 1
+            customization = ""
+            if arg:
+                parts = arg.split(maxsplit=1)
+                try:
+                    rounds = max(1, min(int(parts[0]), 5))
+                    customization = parts[1].strip() if len(parts) > 1 else ""
+                except ValueError:
+                    rounds = 1
+                    customization = arg
+            console.print(
+                Panel(
+                    super_assistant.retry_last_temp_failure(rounds, customization, iteration_mode="evolve"),
+                    title="Temp Evolve",
+                    border_style="cyan",
+                )
+            )
+            continue
+        if user_input == "/kept-tools":
+            if not config.super_assistant:
+                console.print("[yellow]Super assistant mode is off. Use /assistant on first.[/yellow]")
+                continue
+            rows = super_assistant.show_kept_capabilities()
+            if not rows:
+                console.print("[dim]No kept capability files found.[/dim]")
+            else:
+                lines = ["[bold cyan]Kept capability files:[/bold cyan]"]
+                lines.extend(f"- {row}" for row in rows)
+                console.print(Panel("\n".join(lines), title="Kept Capabilities", border_style="cyan"))
+            continue
+        if user_input == "/qc-reports" or user_input.startswith("/qc-reports "):
+            if not config.super_assistant:
+                console.print("[yellow]Super assistant mode is off. Use /assistant on first.[/yellow]")
+                continue
+            arg = user_input[len("/qc-reports"):].strip()
+            limit = 10
+            if arg:
+                try:
+                    limit = max(1, min(int(arg), 100))
+                except ValueError:
+                    console.print("[yellow]Usage: /qc-reports [N][/yellow]")
+                    continue
+            rows = super_assistant.show_qc_reports(limit=limit)
+            if not rows:
+                console.print("[dim]No QC reports found.[/dim]")
+            else:
+                lines = [f"[bold cyan]QC reports (latest {len(rows)}):[/bold cyan]"]
+                for row in rows:
+                    lines.append(f"- {row['name']}")
+                    lines.append(f"  modified_utc={row['modified_at']}")
+                    lines.append(f"  path={row['path']}")
+                console.print(Panel("\n".join(lines), title="QC Reports", border_style="cyan"))
+            continue
+        if user_input.startswith("/qc-report "):
+            if not config.super_assistant:
+                console.print("[yellow]Super assistant mode is off. Use /assistant on first.[/yellow]")
+                continue
+            target = user_input[len("/qc-report "):].strip()
+            if not target:
+                console.print("[yellow]Usage: /qc-report <name|path>[/yellow]")
+                continue
+            ok, payload = super_assistant.get_qc_report_summary(target)
+            if not ok:
+                console.print(f"[red]QC report read failed:[/red] {payload}")
+                continue
+            data = payload if isinstance(payload, dict) else {}
+            review = data.get("review", {})
+            verify = data.get("verify", {})
+            models = data.get("models", {})
+            trace = data.get("trace", [])
+            lines = [
+                f"name={data.get('name', '')}",
+                f"path={data.get('path', '')}",
+                f"timestamp_utc={data.get('timestamp_utc', '')}",
+                f"requirement={data.get('requirement', '')}",
+                f"iteration_mode={data.get('iteration_mode', 'fix')}",
+                f"capability_delta_count={len(data.get('capability_delta', [])) if isinstance(data.get('capability_delta', []), list) else 0}",
+                "models:",
+                f"  review={models.get('review', '')}",
+                f"  repair={models.get('repair', '')}",
+                f"  verify={models.get('verify', '')}",
+                "review:",
+                f"  approved={review.get('approved', False)}",
+                f"  risk_level={review.get('risk_level', '')}",
+                f"  issues_count={review.get('issues_count', 0)}",
+                "verify:",
+                f"  pass={verify.get('pass', False)}",
+                f"  reason={verify.get('reason', '')}",
+                f"  must_fix_count={verify.get('must_fix_count', 0)}",
+                "trace:",
+            ]
+            if isinstance(trace, list) and trace:
+                lines.extend(f"  - {str(x)}" for x in trace[:30])
+            else:
+                lines.append("  - (none)")
+            console.print(Panel("\n".join(lines), title="QC Report Summary", border_style="cyan"))
+            continue
+        if user_input.startswith("/temp-tool "):
+            if not config.super_assistant:
+                console.print("[yellow]Super assistant mode is off. Use /assistant on first.[/yellow]")
+                continue
+            payload = user_input[len("/temp-tool "):].strip()
+            if payload.startswith("load "):
+                target = payload[len("load "):].strip()
+                ok, detail = super_assistant.load_temp_capability(target)
+                if ok:
+                    console.print(f"[green]Loaded temporary capability:[/green] {detail}")
+                else:
+                    console.print(f"[red]Load failed:[/red] {detail}")
+                continue
+            if payload.startswith("keep "):
+                name = payload[len("keep "):].strip()
+                ok, detail = super_assistant.keep_temp_capability(name)
+                if ok:
+                    console.print(f"[green]Kept capability and unloaded from memory:[/green] {detail}")
+                else:
+                    console.print(f"[red]Keep failed:[/red] {detail}")
+                continue
+            if payload.startswith("discard "):
+                name = payload[len("discard "):].strip()
+                ok = super_assistant.discard_temp_capability(name)
+                if ok:
+                    console.print(f"[green]Discarded temporary capability:[/green] {name}")
+                else:
+                    console.print(f"[yellow]Temporary capability not found:[/yellow] {name}")
+                continue
+            if payload == "clear":
+                cleared = super_assistant.clear_temp_capabilities()
+                console.print(f"[green]Cleared {cleared} temporary capabilities.[/green]")
+                continue
+            if payload == "autoload":
+                state = "on" if config.autoload_kept_temp_tools else "off"
+                console.print(f"Autoload kept temp tools is [cyan]{state}[/cyan]")
+                continue
+            if payload.startswith("autoload "):
+                arg = payload[len("autoload "):].strip().lower()
+                if arg in ("on", "off"):
+                    enabled = arg == "on"
+                    config.autoload_kept_temp_tools = enabled
+                    super_assistant.set_autoload_kept_temp_tools(enabled)
+                    console.print(f"Autoload kept temp tools switched [cyan]{arg}[/cyan]")
+                    continue
+                console.print("[yellow]Usage: /temp-tool autoload on|off[/yellow]")
+                continue
+            if payload == "load-kept":
+                loaded = super_assistant.autoload_kept_temp_tools()
+                if not loaded:
+                    console.print("[dim]No kept capabilities loaded.[/dim]")
+                else:
+                    console.print(Panel("\n".join(loaded), title="Loaded Kept Capabilities", border_style="cyan"))
+                continue
+            console.print("[yellow]Usage: /temp-tool load <file>|keep <name>|discard <name>|clear|autoload on|off|load-kept[/yellow]")
             continue
         if user_input == "/sandbox":
             console.print(
@@ -615,6 +1003,7 @@ def _show_help():
         "  /reset         Clear conversation history\n"
         "  /model         Show current model\n"
         "  /model <name>  Switch model mid-conversation\n"
+        "  /model-backend local|cloud  Auto-detect local endpoints or switch to cloud backend\n"
         "  /tokens        Show token usage\n"
         "  /compact       Compress conversation context\n"
         "  /diff          Show files modified this session\n"
@@ -624,6 +1013,7 @@ def _show_help():
         "  /validate-output on|off  Toggle output sanitizer/validator\n"
         "  /stream on|off  Toggle token-by-token streaming display\n"
         "  /assistant on|off  Toggle supervisor + experts mode\n"
+        "  /coding-toolsmith on|off  Toggle temporary tool generation by coding expert\n"
         "  /context       Show SuperAssistant session context (last file, route, turns)\n"
         "  /context clear Clear session (and delete snapshot if persist is on)\n"
         "  /context persist on|off|reload  Toggle disk persistence or reload from .session.json\n"
@@ -633,6 +1023,20 @@ def _show_help():
         "  /reload-mappings  Reload browser site mapping config\n"
         "  /show-mappings  Show active browser site mappings\n"
         "  /show-file-tools  Show current tools available to file expert\n"
+        "  /temp-tools     Show currently loaded temporary capabilities\n"
+        "  /temp-retry [N] [custom]  Retry last failure with optional customization\n"
+        "  /temp-evolve [N] [goal]  Iterate by extending temporary capability goals\n"
+        "  /kept-tools     Show kept capability files on disk\n"
+        "  /qc-reports [N]  List latest quality-control reports\n"
+        "  /qc-report <name|path>  Show one QC report summary\n"
+        "  /temp-tool load <file>  Load a temporary capability from a Python file\n"
+        "  /temp-tool keep <name>  Keep file but unload temp capability from memory\n"
+        "  /temp-tool discard <name>  Unload and delete a temporary capability\n"
+        "  /temp-tool clear  Clear all temporary capabilities\n"
+        "  /temp-tool autoload on|off  Toggle startup auto-load for kept tools (current process)\n"
+        "  /temp-tool load-kept  Load all kept tools now\n"
+        "  也可以直接说：请编程专家为这个需求创建一个临时工具 ...\n"
+        "  Env: CORECODER_AUTOLOAD_KEPT_TEMP_TOOLS=on 可在新会话启动时自动挂载已保留工具\n"
         "  /sandbox       Show current effective sandbox root\n"
         "  /debug         Show registered planners/actions and risk policy\n"
         "  /files-help  Show file tools params and examples\n"

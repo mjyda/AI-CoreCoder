@@ -25,7 +25,7 @@ DEFAULT_MCP_SERVERS: tuple[MCPServerSpec, ...] = (
     MCPServerSpec(
         name="browser-history-mcp",
         capability="browser-history",
-        tool_names=("browser_history",),
+        tool_names=("browser_history", "fetch_url_content"),
     ),
     MCPServerSpec(
         name="filesystem-mcp",
